@@ -1,0 +1,78 @@
+# Python cache / build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test / type-check / coverage caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# IDE / editor files
+.idea/
+.vscode/
+*.code-workspace
+*.swp
+*.swo
+*~
+
+# Local secrets and environment variables
+.env
+.env.*
+!.env.example
+
+# Local databases
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Runtime logs and diagnostics
+logs/
+*.log
+crash.txt
+debug_*.html
+debug_*.png
+error_*_err.html
+error_*_err.png
+
+# Local comparison / patch scratch files
+src/ui/views/*.txt
+
+# Generated output
+output/
+output_test/
+
+# Chrome profiles contain cookies, sessions, history and large browser caches
+data/profiles/
+
+# Per-machine / per-user application settings
+data/config*.json
+src/data/config*.json
+
+# Playwright artifacts
+playwright-report/
+test-results/
+blob-report/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
