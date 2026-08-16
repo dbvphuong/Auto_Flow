@@ -33,6 +33,7 @@ class Task(Base):
     account_id = Column(Integer, nullable=True) # Which account executed this
     task_type = Column(String, default="image")
     session_id = Column(Integer, nullable=True) # Link to image_sessions table
+    retry_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class ImageSession(Base):
@@ -77,4 +78,5 @@ class GeminiBatch(Base):
     account_id = Column(Integer, nullable=True)
     result_path = Column(String, nullable=True)
     error_message = Column(Text, nullable=True)
+    retry_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)

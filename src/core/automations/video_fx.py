@@ -1,7 +1,12 @@
 import os
 import time
 import logging
+import re
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from .flow_ui import (
+    click_generate, configure_generation, dismiss_dashboard_promos,
+    enter_flow_app, find_prompt_input, generation_is_busy, open_new_project,
+)
 
 class FlowGenerationFailed(Exception):
     pass
@@ -25,16 +30,29 @@ def _close_welcome_popups(page):
         "Got it", "Đã hiểu", "close Đóng", "Bỏ qua", "Skip",
         "Tôi đồng ý", "Agree"
     ]
-    for keyword in close_keywords:
+    dialogs = page.locator(
+        '[role="dialog"], [aria-modal="true"], '
+        '[data-radix-dialog-content], [data-state="open"][data-radix-portal]'
+    )
+    for dialog_index in range(dialogs.count()):
+        dialog = dialogs.nth(dialog_index)
         try:
-            btns = page.locator(f'button:has-text("{keyword}"), [aria-label*="{keyword}" i]').all()
-            for btn in btns:
-                if btn.is_visible():
-                    logging.info(f"[Flow Video] Tự động click nút đóng popup: {keyword}")
-                    btn.click(force=True)
-                    page.wait_for_timeout(500)
+            if not dialog.is_visible():
+                continue
+            for keyword in close_keywords:
+                buttons = dialog.get_by_role(
+                    "button", name=re.compile(rf"^\s*{re.escape(keyword)}\s*$", re.I)
+                )
+                for button_index in range(buttons.count()):
+                    button = buttons.nth(button_index)
+                    if button.is_visible():
+                        logging.info(f"[Flow Video] Tự động đóng popup: {keyword}")
+                        button.click(force=True)
+                        page.wait_for_timeout(500)
+                        break
         except Exception:
-            pass
+            continue
+    dismiss_dashboard_promos(page)
 
 def _close_visible_toasts(page):
     for text in ["Đóng", "Close"]:
@@ -140,6 +158,29 @@ def _download_video(page, generated_tile, quality, file_path):
 
     raise PlaywrightTimeoutError(f"Timeout chờ tải video chất lượng {quality}")
 
+
+def _download_video_with_retry(page, generated_tile, quality, file_path, attempts=3):
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return _download_video(page, generated_tile, quality, file_path)
+        except Exception as exc:
+            last_error = exc
+            if "Target page, context or browser has been closed" in str(exc):
+                raise
+            logging.warning(
+                "[Flow Video] Tải video %s lỗi lần %s/%s: %s",
+                quality, attempt, attempts, exc,
+            )
+            if attempt < attempts:
+                try:
+                    page.keyboard.press("Escape")
+                except Exception:
+                    pass
+                page.wait_for_timeout(1500)
+    raise last_error
+
+
 def _wait_for_video_ready(page, timeout_ms=180000):
     try:
         page.wait_for_function(
@@ -202,7 +243,8 @@ def _generation_failed_tile_ids(page, visible_only=True):
                     while (parent) {
                         if (parent === document.body) break;
                         const style = window.getComputedStyle(parent);
-                        if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity) === 0) {
+                        const opacity = Number.parseFloat(style.opacity);
+                        if (style.display === 'none' || style.visibility === 'hidden' || (!Number.isNaN(opacity) && opacity < 0.1)) {
                             return false;
                         }
                         parent = parent.parentElement;
@@ -214,20 +256,28 @@ def _generation_failed_tile_ids(page, visible_only=True):
                     const visible = isRealVisible(tile);
                     if (visibleOnly && !visible) return false;
 
-                    const hasWarningIcon = Array.from(tile.querySelectorAll("i")).some(icon => {
+                    const visibleWarningIcons = Array.from(tile.querySelectorAll("i")).filter(icon => {
                         const iconName = (icon.textContent || "").trim().toLowerCase();
                         const iconVisible = isRealVisible(icon);
                         return (!visibleOnly || iconVisible) && (iconName === "warning" || iconName === "warning_amber" || iconName === "error");
                     });
 
-                    const hasErrorText = Array.from(tile.querySelectorAll("span, div, p, a")).some(el => {
-                        const textContent = (el.textContent || el.innerText || "").toLowerCase();
-                        const elVisible = isRealVisible(el);
-                        if (visibleOnly && !elVisible) return false;
-                        return keywords.some(kw => textContent.includes(kw.toLowerCase()));
+                    // Flow keeps a hidden failure card inside every tile while it is generating.
+                    // Only accept error text from the same visible card as a visible warning icon.
+                    const hasVisibleFailureCard = visibleWarningIcons.some(icon => {
+                        let card = icon.parentElement;
+                        while (card && card !== tile.parentElement) {
+                            if ((!visibleOnly || isRealVisible(card))) {
+                                const ownText = (card.textContent || "").toLowerCase();
+                                if (keywords.some(kw => ownText.includes(kw.toLowerCase()))) return true;
+                            }
+                            if (card === tile) break;
+                            card = card.parentElement;
+                        }
+                        return false;
                     });
 
-                    return hasWarningIcon && hasErrorText;
+                    return hasVisibleFailureCard;
                 }).map(tile => tile.getAttribute("data-tile-id") || "");
             }""",
             { "visibleOnly": visible_only, "keywords": keywords }
@@ -235,6 +285,87 @@ def _generation_failed_tile_ids(page, visible_only=True):
     except Exception as e:
         logging.error(f"[Flow Video] Lỗi kiểm tra tile lỗi: {e}")
         return []
+
+
+def _visible_agent_error(page):
+    try:
+        return page.locator("body").evaluate(
+            """(body) => {
+                const pattern = /Không thành công|Tác nhân đang bị quá tải|vui lòng thử lại sau vài phút|Unsuccessful|Agent is overloaded|try again in a few minutes/i;
+                const visible = (el) => {
+                    if (!el || !(el.offsetWidth || el.offsetHeight || el.getClientRects().length)) return false;
+                    for (let cur = el; cur && cur !== document.body; cur = cur.parentElement) {
+                        const style = getComputedStyle(cur);
+                        const opacity = Number.parseFloat(style.opacity);
+                        if (style.display === 'none' || style.visibility === 'hidden'
+                                || (!Number.isNaN(opacity) && opacity < 0.1)) return false;
+                    }
+                    return true;
+                };
+                return Array.from(body.querySelectorAll('div, span, p')).some(el => {
+                    const own = Array.from(el.childNodes).filter(n => n.nodeType === Node.TEXT_NODE)
+                        .map(n => n.textContent || '').join(' ').trim();
+                    return own && pattern.test(own) && visible(el);
+                });
+            }"""
+        )
+    except Exception:
+        return False
+
+
+def _generation_progress(page, tile_id=None):
+    """Read only a genuinely visible percentage; hidden failure cards are ignored."""
+    try:
+        return page.evaluate(
+            r"""(tileId) => {
+                const visible = (el) => {
+                    if (!el || !(el.offsetWidth || el.offsetHeight || el.getClientRects().length)) return false;
+                    for (let cur = el; cur && cur !== document.body; cur = cur.parentElement) {
+                        const style = getComputedStyle(cur);
+                        const opacity = Number.parseFloat(style.opacity);
+                        if (style.display === 'none' || style.visibility === 'hidden'
+                                || (!Number.isNaN(opacity) && opacity < 0.1)) return false;
+                    }
+                    return true;
+                };
+                let roots = [document.body];
+                if (tileId) {
+                    roots = Array.from(document.querySelectorAll('[data-tile-id]'))
+                        .filter(el => el.getAttribute('data-tile-id') === tileId && visible(el));
+                }
+                for (const root of roots) {
+                    for (const el of root.querySelectorAll('div, span, p, a')) {
+                        if (!visible(el)) continue;
+                        const own = Array.from(el.childNodes).filter(n => n.nodeType === Node.TEXT_NODE)
+                            .map(n => n.textContent || '').join(' ').trim();
+                        const match = own.match(/^([0-9]{1,3})\s*%$/);
+                        if (match) return Number(match[1]);
+                    }
+                }
+                return null;
+            }""",
+            tile_id,
+        )
+    except Exception:
+        return None
+
+
+def _active_prompt_texts(page):
+    try:
+        return page.evaluate(
+            """() => Array.from(document.querySelectorAll(
+                    '[role="textbox"][contenteditable="true"], textarea:not([name*="recaptcha"])'))
+                .filter(el => {
+                    const rect = el.getBoundingClientRect();
+                    const style = getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0
+                        && style.display !== 'none' && style.visibility !== 'hidden';
+                })
+                .map(el => (el.value !== undefined ? el.value : el.textContent || '').trim())"""
+        )
+    except Exception:
+        return []
+
 
 def _generated_video_count(page):
     try:
@@ -251,19 +382,9 @@ def _generated_video_count(page):
     except Exception:
         return 0
 
-def clear_browser_history(page):
-    logging.info("[Flow Video] Đang thực hiện xóa lịch sử duyệt web 1 giờ qua...")
-    try:
-        page.goto("chrome://settings/clearBrowserData?search=cook", timeout=15000)
-        page.wait_for_timeout(3000)
-        page.keyboard.press("Enter")
-        page.wait_for_timeout(5000)
-        logging.info("[Flow Video] Đã xóa lịch sử duyệt web thành công!")
-    except Exception as e:
-        logging.warning(f"[Flow Video] Không thể xóa lịch sử duyệt web tự động: {e}")
-
 def run_video_fx(context, account, prompt, task_id, config):
-    max_attempts = 5
+    # Video tốn nhiều credit; tuyệt đối không tự gửi lại một request không chắc chắn.
+    max_attempts = 1
     last_error = None
     for attempt in range(1, max_attempts + 1):
         try:
@@ -273,19 +394,13 @@ def run_video_fx(context, account, prompt, task_id, config):
         except Exception as exc:
             last_error = exc
             err_msg = str(exc)
-            if "Tài khoản đã bị đăng xuất" in err_msg or "Signed out" in err_msg:
-                logging.error(f"[Flow Video] Bỏ qua retry do tài khoản đã bị đăng xuất: {err_msg}")
+            if ("Tài khoản đã bị đăng xuất" in err_msg or "Signed out" in err_msg
+                    or "Không thể tải video" in err_msg):
+                logging.error(f"[Flow Video] Bỏ qua retry với lỗi không nên tạo lại: {err_msg}")
                 raise
             logging.warning(f"[Flow Video] Thử lại tạo video thất bại lần {attempt}/{max_attempts}: {err_msg}")
             if attempt >= max_attempts:
                 break
-            if attempt == 3:
-                try:
-                    temp_page = context.new_page()
-                    clear_browser_history(temp_page)
-                    temp_page.close()
-                except Exception as clear_err:
-                    logging.warning(f"[Flow Video] Lỗi khi mở trang xóa lịch sử: {clear_err}")
             time.sleep(2)
     raise Exception(f"Flow tạo video Không thành công sau {max_attempts} lần thử: {last_error}")
 
@@ -306,6 +421,8 @@ def _run_video_fx_once(context, account, prompt, task_id, config):
 
         # 1. Tự động đóng các popup quảng cáo/chào mừng
         _close_welcome_popups(page)
+
+        enter_flow_app(page)
 
         # 2. Đợi chuyển hướng SetSID
         for _ in range(30):
@@ -332,15 +449,10 @@ def _run_video_fx_once(context, account, prompt, task_id, config):
 
         # Kiểm tra đăng xuất
         login_btn = page.locator('button:has-text("Đăng nhập"), button:has-text("Sign in"), a:has-text("Sign in"), a:has-text("Đăng nhập"), [aria-label*="Sign in" i]').first
-        public_cta = page.locator('button:has-text("Create with Google Flow"), button:has-text("Explore Tools"), button:has-text("Create with Flow")').first
-        profile_img = page.locator('button:has(img[alt*="hồ sơ" i]), button:has(img[alt*="profile" i]), button:has(img)').first
-
         is_signed_out = False
         if login_btn.is_visible():
             is_signed_out = True
         elif "accounts.google" in page.url and ("signin" in page.url or "ServiceLogin" in page.url):
-            is_signed_out = True
-        elif public_cta.is_visible() and not profile_img.is_visible():
             is_signed_out = True
 
         if is_signed_out:
@@ -348,15 +460,21 @@ def _run_video_fx_once(context, account, prompt, task_id, config):
 
         # Xác định trạng thái trang
         try:
-            dashboard_element = page.locator('button:has-text("Dự án mới"), button:has-text("New project"), button:has-text("add_2"), button:has-text("Bắt đầu"), button:has-text("Get started")').first
+            dashboard_element = page.locator(
+                'button:has-text("Dự án mới"), button:has-text("New project")'
+            ).first
             work_node_element = page.locator('div:has-text("Bắt đầu tạo hoặc thả nội dung nghe nhìn"), div:has-text("Start creating or drop media"), div:has-text("Bắt đầu tạo")').last
+            workspace_prompt = page.locator(
+                '[role="textbox"][contenteditable="true"], textarea:not([name*="recaptcha"])'
+            )
             
             found_where = None
             for _ in range(40):
                 if dashboard_element.is_visible():
                     found_where = "dashboard"
                     break
-                if work_node_element.is_visible():
+                if (work_node_element.is_visible()
+                        or workspace_prompt.count() > 0 and workspace_prompt.last.is_visible()):
                     found_where = "workspace"
                     break
                 page.wait_for_timeout(500)
@@ -364,27 +482,19 @@ def _run_video_fx_once(context, account, prompt, task_id, config):
             if found_where == "dashboard":
                 logging.info("[Flow Video] Khởi tạo Dự án mới...")
                 
-                # Click và chờ chuyển hướng dự án mới
-                redirected = False
-                for click_attempt in range(6):
-                    _close_welcome_popups(page)
-                    try:
-                        dashboard_element.click(force=True)
-                    except Exception:
-                        pass
-                    page.wait_for_timeout(1500)
-                    if "project=" in page.url:
-                        redirected = True
-                        logging.info("[Flow Video] Đã chuyển hướng thành công vào URL dự án mới.")
-                        break
-                
-                if not redirected:
-                    logging.warning("[Flow Video] Không nhận diện được chuyển hướng URL dự án mới, tiếp tục chạy...")
+                _close_welcome_popups(page)
+                try:
+                    open_new_project(page, attempts=3)
+                except Exception as redirect_error:
+                    raise RuntimeError(
+                        f"Flow không mở được dự án video mới: {redirect_error}"
+                    ) from redirect_error
 
                 if "accounts.google" in page.url and ("signin" in page.url or "ServiceLogin" in page.url):
                     raise Exception("Tài khoản đã bị đăng xuất (Signed out) trên Google. Vui lòng đăng nhập lại tài khoản này trên giao diện Tool.")
 
                 workspace_indicator = page.locator(
+                    '[role="textbox"][contenteditable="true"], textarea:not([name*="recaptcha"]), '
                     'p:has-text("Bạn muốn tạo gì?"), p:has-text("What do you want to create?"), '
                     'div:has-text("Bắt đầu tạo hoặc thả nội dung nghe nhìn"), div:has-text("Start creating or drop media"), '
                     'div:has-text("Bắt đầu tạo")'
@@ -404,7 +514,8 @@ def _run_video_fx_once(context, account, prompt, task_id, config):
             elif found_where == "workspace":
                 logging.debug("[Flow Video] Đã ở sẵn trong workspace.")
         except Exception as e:
-            if "Tài khoản đã bị đăng xuất" in str(e):
+            if ("Tài khoản đã bị đăng xuất" in str(e)
+                    or "Flow không mở được dự án" in str(e)):
                 raise
             logging.debug(f"[Flow Video] Bỏ qua bước xác định trang: {e}")
 
@@ -445,21 +556,7 @@ def _run_video_fx_once(context, account, prompt, task_id, config):
         # 4. Tập trung vào ô prompt và tắt Tác nhân (Agent) nếu đang bật
         try:
             # Tìm ô prompt hoạt động thực sự (lọc các phần tử hiển thị)
-            prompt_input = None
-            prompt_locs = page.locator('textarea:not([name*="recaptcha"]), [contenteditable="true"]')
-            for idx in range(prompt_locs.count()):
-                loc = prompt_locs.nth(idx)
-                if loc.is_visible():
-                    prompt_input = loc
-            
-            if not prompt_input:
-                import re
-                prompt_input = page.get_by_placeholder(re.compile(r"Bạn muốn tạo gì|What do you want to create", re.I)).first
-            
-            if not prompt_input or not prompt_input.is_visible():
-                prompt_input = page.locator('textarea:not([name*="recaptcha"]), [contenteditable="true"]').last
-            
-            prompt_input.wait_for(state="visible", timeout=15000)
+            prompt_input = find_prompt_input(page)
             prompt_input.click(force=True)
             page.wait_for_timeout(500)
             
@@ -470,7 +567,8 @@ def _run_video_fx_once(context, account, prompt, task_id, config):
             except:
                 pass
                 
-            if agent_btn.count() > 0:
+            new_settings_btn = page.locator('button:has-text("tune")').first
+            if not new_settings_btn.is_visible() and agent_btn.count() > 0:
                 is_pressed = agent_btn.get_attribute("aria-pressed")
                 # Nếu nút đang được nhấn (aria-pressed="true") -> Agent đang active, cần click để tắt
                 if is_pressed == "true":
@@ -483,145 +581,13 @@ def _run_video_fx_once(context, account, prompt, task_id, config):
                 
             # Điền prompt
             logging.info(f"[Flow Video] Điền prompt: '{prompt}'")
-            page.keyboard.press("Control+A")
-            page.keyboard.press("Backspace")
             prompt_input.fill(prompt)
             page.wait_for_timeout(1000)
         except Exception as e:
-            logging.warning(f"[Flow Video] Lỗi điền prompt hoặc xử lý Tác nhân: {e}")
-            try:
-                page.keyboard.type(prompt)
-                page.wait_for_timeout(1000)
-            except:
-                pass
+            raise RuntimeError(f"Không thể điền prompt video vào Google Flow: {e}") from e
 
-        # 5. Cấu hình Model, Tỷ lệ video, Chế độ Video
-        try:
-            logging.info("[Flow Video] Mở panel cấu hình...")
-            # Lọc tìm nút config hiển thị thực tế
-            config_btn = None
-            config_locs = page.locator(
-                'button:has-text("Banana"), button:has-text("Nano"), button:has-text("Imagen"), '
-                'button:has-text("🍌"), button:has-text("Veo"), button:has-text("Omni"), '
-                'button:has-text("Veo3.1"), button:has-text("Flash"), button:has-text("Lite"), '
-                'button:has-text("Fast"), button:has-text("Quality")'
-            )
-            for idx in range(config_locs.count()):
-                loc = config_locs.nth(idx)
-                if loc.is_visible():
-                    config_btn = loc
-                    break
-            if not config_btn:
-                config_btn = config_locs.first
-            
-            # Cải tiến: Nếu nút config chính chưa sẵn sàng, click vào vùng trống để focus rồi check lại
-            try:
-                config_btn.wait_for(state="visible", timeout=6000)
-            except Exception:
-                logging.debug("[Flow Video] Nút config chính chưa thấy, thử click vùng nhập prompt để trigger...")
-                prompt_input.click(force=True)
-                page.wait_for_timeout(1000)
-                config_btn.wait_for(state="visible", timeout=6000)
-                
-            config_btn.click(force=True)
-            
-            # Đợi panel cấu hình hiển thị
-            config_panel = page.locator('[data-radix-menu-content], .DropdownMenuContent, [role="menu"]').first
-            config_panel.wait_for(state="visible", timeout=10000)
-            page.wait_for_timeout(1000)
-
-            # A. Chuyển tab sang VIDEO
-            try:
-                # Tìm tab Video bằng text trong panel cấu hình
-                video_tab = page.locator(
-                    '[data-radix-menu-content] button[role="tab"]:has-text("Video"), '
-                    '[data-radix-menu-content] button:has-text("Video"), '
-                    'button[role="tab"]:has-text("Video")'
-                ).first
-                video_tab.wait_for(state="visible", timeout=5000)
-                video_tab.click(force=True)
-                logging.info("[Flow Video] Đã chọn chế độ tạo: Video")
-                page.wait_for_timeout(1000)
-            except Exception as ex:
-                logging.warning(f"[Flow Video] Không chuyển được sang tab Video: {ex}")
-
-            # B. Chọn Model bằng từ khóa (để tránh lệch dấu cách hoặc credit text)
-            selected_model = config.get("model", "Veo 3.1 - Fast [20 Credit]")
-            model_keyword = "Fast"
-            if "Lite" in selected_model:
-                model_keyword = "Lite"
-            elif "Flash" in selected_model or "Omni" in selected_model:
-                model_keyword = "Omni"
-            elif "Quality" in selected_model:
-                model_keyword = "Quality"
-
-            # Click mở menu model (nút dropdown trong popup cấu hình)
-            try:
-                model_dropdown_trigger = page.locator(
-                    '[data-radix-menu-content] button[aria-haspopup="menu"], '
-                    '.DropdownMenuContent button[aria-haspopup="menu"]'
-                ).first
-                model_dropdown_trigger.wait_for(state="visible", timeout=5000)
-                
-                current_model_text = model_dropdown_trigger.inner_text()
-                if model_keyword.lower() in current_model_text.lower() or (model_keyword == "Omni" and "flash" in current_model_text.lower()):
-                    logging.info(f"[Flow Video] Model chứa từ khóa '{model_keyword}' đã được chọn sẵn.")
-                else:
-                    model_dropdown_trigger.click(force=True)
-                    page.wait_for_timeout(1000)
-
-                    # Chọn option model tương ứng
-                    model_option = page.locator(
-                        f'[role="menuitem"]:has-text("{model_keyword}"), '
-                        f'[role="option"]:has-text("{model_keyword}"), '
-                        f'button:has-text("{model_keyword}"), '
-                        f'span:has-text("{model_keyword}")'
-                    ).last
-                    
-                    if model_keyword == "Omni":
-                        model_option = page.locator(
-                            '[role="menuitem"]:has-text("Omni"), [role="menuitem"]:has-text("Flash"), '
-                            '[role="option"]:has-text("Omni"), [role="option"]:has-text("Flash"), '
-                            'button:has-text("Omni"), button:has-text("Flash"), '
-                            'span:has-text("Omni"), span:has-text("Flash")'
-                        ).last
-
-                    model_option.wait_for(state="visible", timeout=5000)
-                    model_option.click(force=True)
-                    logging.info(f"[Flow Video] Đã đổi model sang: {model_keyword}")
-                    page.wait_for_timeout(1000)
-            except Exception as ex:
-                logging.warning(f"[Flow Video] Không chọn được model với từ khóa {model_keyword}: {ex}")
-
-            # C. Chọn Tỷ lệ video
-            aspect_ratio = config.get("aspect_ratio", "16:9 Ngang")
-            ratio_pattern = "16:9" if "16:9" in aspect_ratio else "9:16"
-            try:
-                ratio_tab = page.locator(
-                    f'[data-radix-menu-content] button[role="tab"]:has-text("{ratio_pattern}"), '
-                    f'.DropdownMenuContent button:has-text("{ratio_pattern}"), '
-                    f'button:has-text("{ratio_pattern}")'
-                ).first
-                ratio_tab.click(force=True)
-                logging.info(f"[Flow Video] Đã chọn tỷ lệ video: {ratio_pattern}")
-                page.wait_for_timeout(500)
-            except Exception as ex:
-                logging.warning(f"[Flow Video] Không chọn được tỷ lệ video {ratio_pattern}: {ex}")
-
-            # D. Chọn Số lượng video (ở đây mặc định dùng 1x)
-            try:
-                count_tab = page.locator(
-                    '[data-radix-menu-content] button[role="tab"]:has-text("1x"), '
-                    '.DropdownMenuContent button:has-text("1x"), '
-                    'button:has-text("1x")'
-                ).first
-                count_tab.click(force=True)
-                page.wait_for_timeout(500)
-            except Exception as ex:
-                logging.warning(f"[Flow Video] Không chọn được số lượng 1x: {ex}")
-
-        except Exception as e:
-            logging.warning(f"[Flow Video] Lỗi cấu hình nâng cao: {e}")
+        # 5. Cấu hình theo đúng giao diện Flow đang hiển thị.
+        configure_generation(page, prompt_input, "video", config)
 
         # 6. Nhấn Tạo video
         try:
@@ -633,29 +599,54 @@ def _run_video_fx_once(context, account, prompt, task_id, config):
             ))
             logging.debug(f"[Flow Video] Các tile hiện tại trước khi tạo: {existing_tiles}")
 
-            # Gửi prompt bằng phím tắt Control+Enter trực tiếp trên ô prompt
-            prompt_input.click(force=True)
-            page.wait_for_timeout(500)
-            prompt_input.press("Control+Enter")
-            page.wait_for_timeout(2000)
+            submitted = False
+            new_tile_id = None
+            video_baseline = _generated_video_count(page)
+            for send_attempt in range(1, 4):
+                click_generate(page, prompt_input)
+                ack_deadline = time.time() + 12
+                while time.time() < ack_deadline:
+                    current_tiles = set(page.locator('[data-tile-id]').evaluate_all(
+                        'elements => elements.map(el => el.getAttribute("data-tile-id"))'
+                    ))
+                    new_tiles = current_tiles - existing_tiles
+                    if new_tiles:
+                        new_tile_id = next(iter(new_tiles))
+                        submitted = True
+                        break
+                    if (_generated_video_count(page) > video_baseline
+                            or _generation_progress(page) is not None):
+                        submitted = True
+                        break
+                    if generation_is_busy(page):
+                        logging.info(
+                            "[Flow Video] Web đã nhận prompt và đang diễn giải; chuyển sang vòng chờ tạo video."
+                        )
+                        submitted = True
+                        break
+                    prompt_texts = _active_prompt_texts(page)
+                    if not prompt_texts or all(not text for text in prompt_texts):
+                        submitted = True
+                        break
+                    page.wait_for_timeout(500)
+                if submitted:
+                    break
+                logging.warning(
+                    "[Flow Video] Web chưa nhận lần bấm Tạo %s/3; prompt vẫn còn, bấm lại an toàn.",
+                    send_attempt,
+                )
+            if not submitted:
+                raise FlowGenerationFailed(
+                    "Flow không nhận prompt video sau 3 lần bấm Tạo; chưa phát sinh tile/% tiến độ."
+                )
+            generation_deadline = time.time() + 600
         except Exception as e:
-            logging.warning(f"[Flow Video] Lỗi gửi prompt bằng phím tắt: {e}. Thử click nút Tạo...")
-            try:
-                create_btn = page.locator('button:has(i:has-text("arrow_forward"))').first
-                if not create_btn.is_visible():
-                    create_btn = page.locator('button:has(span:has-text("Tạo")), button:has(span:has-text("Generate")), button:has(span:has-text("Create"))').first
-                create_btn.wait_for(state="visible", timeout=10000)
-                create_btn.click(force=True)
-                page.wait_for_timeout(2000)
-            except Exception as click_err:
-                logging.error(f"[Flow Video] Không thể nhấn nút Tạo: {click_err}")
-                raise FlowGenerationFailed("Không thể gửi prompt để tạo video.")
+            logging.error(f"[Flow Video] Không thể nhấn nút Tạo: {e}")
+            raise FlowGenerationFailed(f"Không thể gửi prompt để tạo video: {e}") from e
 
         # Chờ tile mới xuất hiện
-        new_tile_id = None
         logging.info("[Flow Video] Đang chờ tile video mới xuất hiện...")
-        tile_deadline = time.time() + 20
-        while time.time() < tile_deadline:
+        while new_tile_id is None and time.time() < generation_deadline:
             current_tiles = set(page.locator('[data-tile-id]').evaluate_all(
                 'elements => elements.map(el => el.getAttribute("data-tile-id"))'
             ))
@@ -666,31 +657,37 @@ def _run_video_fx_once(context, account, prompt, task_id, config):
                 break
             page.wait_for_timeout(1000)
 
-        if not new_tile_id:
-            # Nếu không thấy tile mới xuất hiện, fallback lấy tile cuối cùng
-            last_tile = page.locator('[data-tile-id]').last
-            if last_tile.count() > 0:
-                new_tile_id = last_tile.get_attribute("data-tile-id")
-                logging.warning(f"[Flow Video] Không phát hiện tile mới bằng so khớp ID, fallback dùng tile cuối cùng: {new_tile_id}")
-            else:
-                raise FlowGenerationFailed("Không tìm thấy bất kỳ tile nào trên trang sau khi nhấn Tạo.")
+        if not new_tile_id and _generation_progress(page) is None:
+            if generation_is_busy(page):
+                raise RuntimeError(
+                    "Flow vẫn đang diễn giải/tạo video sau 10 phút; không tự gửi lại để tránh trừ credit trùng."
+                )
+            raise FlowGenerationFailed(
+                "Không tìm thấy tile video mới sau khi gửi prompt; không dùng lại tile cũ."
+            )
 
         # Chờ tạo video hoàn tất trên tile mới này
-        logging.info(f"[Flow Video] Đang đợi video trong tile {new_tile_id} được tạo hoàn chỉnh...")
+        logging.info(
+            "[Flow Video] Đang đợi video%s được tạo hoàn chỉnh...",
+            f" trong tile {new_tile_id}" if new_tile_id else "",
+        )
         
-        # Chờ tạo video hoàn tất (Veo có thể tốn từ 30s tới 4 phút tùy chất lượng và server)
-        deadline = time.time() + 240
+        # Veo có thể đứng ở 99% trong hơn 4 phút khi hệ thống đông. Chờ tối đa
+        # 10 phút nhưng không tự gửi lại request để tránh tạo trùng/trừ credit.
         video_ready = False
-        while time.time() < deadline:
-            # Kiểm tra xem tile mới này có bị lỗi không
-            failed_ids = _generation_failed_tile_ids(page, visible_only=True)
-            if new_tile_id in failed_ids:
-                raise FlowGenerationFailed(f"Google Labs Flow báo lỗi tạo video trên tile {new_tile_id}.")
+        last_progress = None
+        while time.time() < generation_deadline:
+            progress = _generation_progress(page, new_tile_id)
+            if progress is not None and progress != last_progress:
+                logging.info("[Flow Video] Video đang được tạo: %s%%; tiếp tục chờ...", progress)
+                last_progress = progress
             
             # Kiểm tra xem video đã sẵn sàng chưa trong tile (đã có video src)
             is_ready = page.evaluate(
                 """(tileId) => {
-                    const tile = document.querySelector(`[data-tile-id="${tileId}"]`);
+                    const tile = tileId
+                        ? document.querySelector(`[data-tile-id="${tileId}"]`)
+                        : document.body;
                     if (!tile) return false;
                     
                     const video = tile.querySelector('video');
@@ -713,14 +710,29 @@ def _run_video_fx_once(context, account, prompt, task_id, config):
                 video_ready = True
                 logging.info(f"[Flow Video] Video trong tile {new_tile_id} đã sẵn sàng!")
                 break
+
+            # A visible percentage always wins over the hidden failure card that
+            # Flow keeps mounted during generation.
+            if progress is None:
+                failed_ids = _generation_failed_tile_ids(page, visible_only=True)
+                tile_failed = bool(new_tile_id and new_tile_id in failed_ids)
+                if tile_failed or _visible_agent_error(page):
+                    raise FlowGenerationFailed(
+                        f"Google Labs Flow báo lỗi tạo video trên tile {new_tile_id or 'chưa gán ID'}."
+                    )
                 
             page.wait_for_timeout(2000)
             
         if not video_ready:
-            logging.warning(f"[Flow Video] Quá thời gian chờ video readyState trên tile {new_tile_id}, tiến hành tải fallback...")
+            if _generation_progress(page, new_tile_id) is not None:
+                raise RuntimeError(
+                    "Flow vẫn đang tạo video sau 10 phút; không tự retry để tránh trừ credit/tạo trùng."
+                )
+            raise FlowGenerationFailed(f"Flow không hoàn tất video sau 10 phút trên tile {new_tile_id}.")
 
         # 7. Đặt tile container kết quả chính xác bằng ID của tile mới (tránh trùng lặp ID gây lỗi strict mode)
-        generated_tiles = page.locator(f'[data-tile-id="{new_tile_id}"]')
+        generated_tiles = (page.locator(f'[data-tile-id="{new_tile_id}"]')
+                           if new_tile_id else page.locator("body"))
         generated_tile = None
         try:
             for i in range(generated_tiles.count()):
@@ -739,7 +751,8 @@ def _run_video_fx_once(context, account, prompt, task_id, config):
         # 8. Tải video
         # Kiểm tra lại xem tile có báo lỗi không
         failed_ids = _generation_failed_tile_ids(page, visible_only=True)
-        if new_tile_id in failed_ids:
+        if (_generation_progress(page, new_tile_id) is None
+                and new_tile_id and new_tile_id in failed_ids):
             raise FlowGenerationFailed(f"Google Labs Flow báo lỗi tạo video trên tile {new_tile_id}.")
 
         # Xác định chất lượng video
@@ -754,13 +767,17 @@ def _run_video_fx_once(context, account, prompt, task_id, config):
 
         try:
             # Hover vào tile container và click tải xuống
-            downloaded = _download_video(page, generated_tile, target_quality, file_path)
+            downloaded = _download_video_with_retry(
+                page, generated_tile, target_quality, file_path, attempts=3
+            )
             if not downloaded and target_quality != "720p":
                 # Fallback chất lượng thấp hơn
                 fallback_quality = "720p"
                 fallback_path = _quality_file_path(save_path, final_name, fallback_quality)
                 logging.warning(f"[Flow Video] Thử tải fallback {fallback_quality}...")
-                _download_video(page, generated_tile, fallback_quality, fallback_path)
+                _download_video_with_retry(
+                    page, generated_tile, fallback_quality, fallback_path, attempts=3
+                )
                 file_path = fallback_path
             
             logging.info(f"[Flow Video] Đã lưu video thành công vào: {file_path}")

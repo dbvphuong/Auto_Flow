@@ -18,7 +18,7 @@ E:\GG\
 ├── logs/                  # Thư mục chứa các file log của từng phiên chạy (tự sinh)
 ├── src/                   # Source code chính của tool
 │   ├── core/              # Xử lý logic nghiệp vụ, đa luồng, tự động hóa
-│   │   ├── automations/   # Các kịch bản Playwright (image_fx.py, gemini.py, video_fx.py)
+│   │   ├── automations/   # Các kịch bản Playwright (flow_ui.py, image_fx.py, gemini.py, video_fx.py)
 │   │   ├── browser_manager.py # Quản lý khởi tạo trình duyệt, cookies, proxy
 │   │   └── workers.py     # Lớp QThread quản lý các luồng chạy ngầm
 │   ├── data/              # Quản lý Database Models và Session

@@ -119,6 +119,22 @@ def init_db():
                 import logging
                 logging.error(f"[DB] Lỗi khi thêm cột session_id: {e}")
 
+    # Lưu số lần retry của task ảnh/video để chỉ báo ERROR sau khi hết lượt.
+    with engine.connect() as conn:
+        try:
+            conn.execute(text("SELECT retry_count FROM tasks LIMIT 1"))
+        except Exception:
+            try:
+                conn.execute(text(
+                    "ALTER TABLE tasks ADD COLUMN retry_count INTEGER DEFAULT 0"
+                ))
+                conn.commit()
+                import logging
+                logging.info("[DB] Đã nâng cấp schema: Thêm retry_count cho tasks.")
+            except Exception as e:
+                import logging
+                logging.error(f"[DB] Lỗi khi thêm retry_count cho tasks: {e}")
+
     # Đảm bảo cột prompts_text tồn tại trong bảng image_sessions
     with engine.connect() as conn:
         try:
@@ -141,6 +157,7 @@ def init_db():
         "country": "VARCHAR",
         "max_continuations": "INTEGER DEFAULT 10",
         "done_marker": "VARCHAR DEFAULT '[[DONE]]'",
+        "retry_count": "INTEGER DEFAULT 0",
     }
     with engine.connect() as conn:
         for column_name, column_type in gemini_columns.items():

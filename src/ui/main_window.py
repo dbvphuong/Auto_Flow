@@ -6,6 +6,8 @@ from PyQt6.QtGui import QIcon, QPixmap, QMovie
 from ui.views.flow_image import FlowImageView
 from ui.views.flow_video import FlowVideoView
 from ui.views.gemini import GeminiView
+from ui.views.media_tools import MediaToolsView
+from ui.views.capcut import CapcutView
 from ui.views.accounts import AccountsView
 
 class MainWindow(QMainWindow):
@@ -56,9 +58,14 @@ class MainWindow(QMainWindow):
         self.btn_flow_image = QPushButton("📷 Flow Ảnh")
         self.btn_flow_video = QPushButton("📹 Flow Video")
         self.btn_gemini = QPushButton("✦ Gemini")
+        self.btn_media_tools = QPushButton("🛠 Sửa Ảnh/Video")
+        self.btn_capcut = QPushButton("🎬 CAPCUT")
         self.btn_accounts = QPushButton("⚙️ Cài đặt hệ thống")
         
-        for btn in [self.btn_flow_image, self.btn_flow_video, self.btn_gemini, self.btn_accounts]:
+        for btn in [
+            self.btn_flow_image, self.btn_flow_video, self.btn_gemini,
+            self.btn_media_tools, self.btn_capcut, self.btn_accounts,
+        ]:
             sidebar_layout.addWidget(btn)
             
         main_layout.addWidget(self.sidebar)
@@ -80,6 +87,16 @@ class MainWindow(QMainWindow):
         self.tab_gemini = GeminiView()
         self.tab_gemini.setStyleSheet("background-color: #181825;")
         self.stacked_widget.addWidget(self.tab_gemini)
+
+        # Media processing tools tab
+        self.tab_media_tools = MediaToolsView()
+        self.tab_media_tools.setStyleSheet("background-color: #181825;")
+        self.stacked_widget.addWidget(self.tab_media_tools)
+
+        # CapCut timeline and background export tools
+        self.tab_capcut = CapcutView()
+        self.tab_capcut.setStyleSheet("background-color: #181825;")
+        self.stacked_widget.addWidget(self.tab_capcut)
         
         # Accounts Tab
         self.tab_accounts = AccountsView()
@@ -92,7 +109,9 @@ class MainWindow(QMainWindow):
         self.btn_flow_image.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(0))
         self.btn_flow_video.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(1))
         self.btn_gemini.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(2))
-        self.btn_accounts.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(3))
+        self.btn_media_tools.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(3))
+        self.btn_capcut.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(4))
+        self.btn_accounts.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(5))
         
         # Đồng bộ di chuyển splitter giữa Flow Ảnh và Flow Video
         self.tab_flow_image.splitter.splitterMoved.connect(
@@ -123,7 +142,10 @@ class MainWindow(QMainWindow):
             if sum(sizes) > 0:
                 self.tab_gemini.splitter.setSizes(sizes)
 
-        buttons = [self.btn_flow_image, self.btn_flow_video, self.btn_gemini, self.btn_accounts]
+        buttons = [
+            self.btn_flow_image, self.btn_flow_video, self.btn_gemini,
+            self.btn_media_tools, self.btn_capcut, self.btn_accounts,
+        ]
         for i, btn in enumerate(buttons):
             if i == index:
                 btn.setStyleSheet("""
@@ -153,7 +175,7 @@ class MainWindow(QMainWindow):
                         color: #ffffff;
                     }
                 """)
-        if index == 3 and hasattr(self, "tab_accounts"):
+        if index == 5 and hasattr(self, "tab_accounts"):
             try:
                 self.tab_accounts.load_accounts()
             except Exception as e:
@@ -165,12 +187,18 @@ class MainWindow(QMainWindow):
         flow_image = getattr(self, "tab_flow_image", None)
         flow_video = getattr(self, "tab_flow_video", None)
         gemini = getattr(self, "tab_gemini", None)
+        media_tools = getattr(self, "tab_media_tools", None)
+        capcut = getattr(self, "tab_capcut", None)
         
         if flow_image and (getattr(flow_image, "active_workers_count", 0) > 0 or getattr(flow_image, "task_queue", [])):
             running = True
         if flow_video and (getattr(flow_video, "active_workers_count", 0) > 0 or getattr(flow_video, "task_queue", [])):
             running = True
         if gemini and (getattr(gemini, "active_workers_count", 0) > 0 or getattr(gemini, "task_queue", [])):
+            running = True
+        if media_tools and media_tools.is_processing:
+            running = True
+        if capcut and capcut.is_processing:
             running = True
             
         if running:
@@ -191,6 +219,10 @@ class MainWindow(QMainWindow):
             flow_video.shutdown_tasks()
         if gemini:
             gemini.shutdown_tasks()
+        if media_tools:
+            media_tools.shutdown_tasks()
+        if capcut:
+            capcut.shutdown_tasks()
             
         try:
             from core.browser_manager import kill_all_registered_chromes

@@ -32,7 +32,8 @@ def load_system_config():
 
 
 def save_system_config(config):
-    merged = DEFAULT_SYSTEM_CONFIG.copy()
+    # Preserve settings owned by other views when one view updates only its section.
+    merged = load_system_config()
     if isinstance(config, dict):
         merged.update(config)
 

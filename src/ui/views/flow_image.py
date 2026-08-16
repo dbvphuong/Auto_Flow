@@ -11,7 +11,7 @@ import os
 
 from data.database import SessionLocal
 from data.models import Task, Account, ImageSession
-from core.workers import AutomationWorker
+from core.workers import AutomationWorker, AUTOMATION_MAX_RETRIES
 
 
 from PyQt6.QtWidgets import QDialog, QDialogButtonBox
@@ -122,7 +122,7 @@ class FlowImageView(QWidget):
         super().__init__()
         self.thumbnail_cache = {}
         self.loading_thumbnails = {}
-        self.page_size = 100
+        self.page_size = 50
         self.current_page = 1
         self.total_pages = 1
         self.init_ui()
@@ -1333,6 +1333,7 @@ class FlowImageView(QWidget):
                     t.prompt = prompts[idx]
                     t.status = "PENDING"
                     t.result_path = None
+                    t.retry_count = 0
                     
                 t.reference_image = ref_image_path
                 
@@ -1544,9 +1545,14 @@ class FlowImageView(QWidget):
                 return
                 
         if mode == "error":
-            db.query(Task).filter(Task.session_id == sess_id, Task.status.like("ERROR%")).update({"status": "PENDING"}, synchronize_session=False)
+            db.query(Task).filter(Task.session_id == sess_id, Task.status.like("ERROR%")).update(
+                {"status": "PENDING", "retry_count": 0}, synchronize_session=False
+            )
         else:
-            db.query(Task).filter(Task.session_id == sess_id).update({"status": "PENDING", "result_path": None}, synchronize_session=False)
+            db.query(Task).filter(Task.session_id == sess_id).update(
+                {"status": "PENDING", "result_path": None, "retry_count": 0},
+                synchronize_session=False,
+            )
             
         sess.status = "PENDING"
         db.commit()
@@ -1697,6 +1703,11 @@ class FlowImageView(QWidget):
                 # 1. Lấy danh sách các tài khoản active từ DB
                 db = SessionLocal()
                 active_accounts = db.query(Account).filter(Account.is_active == True).order_by(Account.position.asc()).all()
+                queued_task = db.query(Task).filter(Task.id == task_info['task_id']).first()
+                previous_account_id = task_info.get('avoid_account_id')
+                if (previous_account_id is None and queued_task
+                        and (queued_task.retry_count or 0) > 0):
+                    previous_account_id = queued_task.account_id
                 db.close()
                 
                 selected_account_id = None
@@ -1712,7 +1723,17 @@ class FlowImageView(QWidget):
                             account_task_counts[w.account_id] += 1
                             
                     # 3. Chọn tài khoản có số lượng tasks đang chạy ít nhất
-                    sorted_accounts = sorted(active_accounts, key=lambda acc: account_task_counts[acc.id])
+                    eligible_accounts = [
+                        acc for acc in active_accounts
+                        if len(active_accounts) == 1 or acc.id != previous_account_id
+                    ]
+                    sorted_accounts = sorted(
+                        eligible_accounts,
+                        key=lambda acc: (
+                            account_task_counts[acc.id],
+                            acc.position if acc.position is not None else 0,
+                        ),
+                    )
                     selected_account = sorted_accounts[0]
                     selected_account_id = selected_account.id
                     logging.info(f"[Queue] Phân bổ tài khoản {selected_account.email} (đang chạy {account_task_counts[selected_account.id]} luồng) cho Task ID {task_info['task_id']}")
@@ -1721,6 +1742,12 @@ class FlowImageView(QWidget):
                 worker.progress.connect(self.update_task_status)
                 worker.task_finished.connect(self.on_task_finished)
                 worker.error.connect(self.on_task_error)
+                worker.retry_requested.connect(
+                    lambda task_id, account_id, retry_number, error_msg,
+                    payload=task_info.copy(): self.on_task_retry(
+                        task_id, account_id, retry_number, error_msg, payload
+                    )
+                )
                 
                 self.workers.append(worker)
                 worker.start()
@@ -1869,6 +1896,22 @@ class FlowImageView(QWidget):
         self.stats_success += 1
         self.update_stats_display()
         self.check_and_advance_batch_session(task_id)
+
+    def on_task_retry(self, task_id, account_id, retry_number, error_msg, task_info):
+        task_info['avoid_account_id'] = account_id
+        if not any(item['task_id'] == task_id for item in self.task_queue):
+            self.task_queue.append(task_info)
+        logging.warning(
+            "[Image Queue] Task %s retry %s/%s; tránh account %s ở lượt kế; queue=%s",
+            task_id, retry_number, AUTOMATION_MAX_RETRIES,
+            account_id, [item['task_id'] for item in self.task_queue],
+        )
+        self.update_table_row(
+            task_id, 5,
+            f"PENDING - Retry {retry_number}/{AUTOMATION_MAX_RETRIES}: {error_msg}",
+        )
+        if not self.queue_timer.isActive():
+            self.queue_timer.start(1000)
 
     def on_task_error(self, task_id, error_msg):
         self.update_table_row(task_id, 5, f"ERROR: {error_msg}")
@@ -2093,6 +2136,7 @@ class FlowImageView(QWidget):
                         if task:
                             task.status = "PENDING"
                             task.result_path = None
+                            task.retry_count = 0
                             if getattr(self, '_current_selected_session_id', None) is None:
                                 self._current_selected_session_id = task.session_id
         db.commit()
@@ -2166,20 +2210,20 @@ class FlowImageView(QWidget):
             QMessageBox.warning(self, "Thiếu tài khoản", "Vui lòng thêm hoặc kích hoạt ít nhất một tài khoản ở tab 'Cài đặt hệ thống'!")
             return
 
-        failed_task_ids = []
         db = SessionLocal()
-        for i in range(self.table_tasks.rowCount()):
-            status_item = self.table_tasks.item(i, 5)
-            if status_item and "ERROR" in status_item.text().upper():
-                task_id = self.table_tasks.item(i, 1).data(Qt.ItemDataRole.UserRole)
-                if task_id:
-                    failed_task_ids.append(task_id)
-                    task = db.query(Task).filter(Task.id == task_id).first()
-                    if task:
-                        task.status = "PENDING"
-                        task.result_path = None
-                        if getattr(self, '_current_rerun_session_id', None) is None:
-                            self._current_rerun_session_id = task.session_id
+        failed_tasks = db.query(Task).filter(
+            Task.task_type == "image", Task.status.like("ERROR%")
+        ).all()
+        failed_task_ids = [task.id for task in failed_tasks]
+        session_ids = {task.session_id for task in failed_tasks if task.session_id}
+        for task in failed_tasks:
+            task.status = "PENDING"
+            task.result_path = None
+            task.retry_count = 0
+        if session_ids:
+            db.query(ImageSession).filter(ImageSession.id.in_(session_ids)).update(
+                {"status": "PENDING"}, synchronize_session=False
+            )
         db.commit()
         db.close()
         
@@ -2187,12 +2231,13 @@ class FlowImageView(QWidget):
             QMessageBox.warning(self, "Thông báo", "Không có công việc nào bị lỗi để chạy lại!")
             return
             
-        for i in range(self.table_tasks.rowCount()):
-            task_id = self.table_tasks.item(i, 1).data(Qt.ItemDataRole.UserRole)
-            if task_id in failed_task_ids:
-                self.update_table_row(task_id, 5, "PENDING")
+        self.load_sessions()
+        self.load_tasks()
                 
-        QMessageBox.information(self, "Thành công", f"Đã chuyển {len(failed_task_ids)} công việc lỗi sang trạng thái PENDING.")
+        QMessageBox.information(
+            self, "Thành công",
+            f"Đã chuyển {len(failed_task_ids)} ảnh lỗi trên tất cả trang và tất cả phiên sang PENDING.",
+        )
 
     def load_real_data(self):
         logging.info("[UI] Nhấn Load dữ liệu thực tế (Chạy theo phiên).")
@@ -2242,6 +2287,7 @@ class FlowImageView(QWidget):
                     if task.status == "COMPLETED":
                         task.status = "PENDING"
                         task.result_path = None
+                        task.retry_count = 0
                         updated_count += 1
                         
         db.commit()

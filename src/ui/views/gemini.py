@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QDialog, QPlainTextEdit, QApplication,
 )
 
-from core.workers import GeminiWorker
+from core.workers import GeminiWorker, GEMINI_MAX_RETRIES
 from common.gemini_languages import COUNTRIES, GEMINI_COUNTRY_OPTIONS, LANGUAGE_BY_COUNTRY
 from data.database import SessionLocal
 from data.models import Account, GeminiBatch
@@ -35,6 +35,7 @@ class GeminiView(QWidget):
         self.window_slot_count = 1
         self.is_paused = False
         self.session_skipped_account_ids = set()
+        self.retry_last_account_ids = {}
         self.no_pro_accounts_notified = False
         self.country_checks = {}
         self._build_ui()
@@ -162,6 +163,11 @@ class GeminiView(QWidget):
         split_controls = QHBoxLayout()
         self.btn_split_lines = QPushButton("↵ CHIA DÒNG")
         self.btn_split_lines.setStyleSheet(self._button_style("#7c3aed", "#8b5cf6"))
+        self.btn_split_lines.setToolTip(
+            "Chia các dòng text quá dài theo số từ tối thiểu/tối đa.\n"
+            "Ưu tiên ngắt ở cuối câu hoặc dấu câu hợp lý.\n"
+            "Không thêm, xóa hay thay đổi nội dung."
+        )
         self.spin_split_min_words = QSpinBox()
         self.spin_split_min_words.setRange(1, 1000)
         self.spin_split_min_words.setValue(15)
@@ -194,6 +200,13 @@ class GeminiView(QWidget):
         smooth_controls = QHBoxLayout()
         self.btn_smooth_text = QPushButton("✨ LÀM MỊN TEXT")
         self.btn_smooth_text.setStyleSheet(self._button_style("#0f766e", "#0d9488"))
+        self.btn_smooth_text.setToolTip(
+            "Chỉ lấy và ghép nội dung nằm giữa các marker PART:\n\n"
+            "[[PART_1_START]]\n"
+            "Nội dung cần lấy\n"
+            "[[PART_1_END]]\n\n"
+            "Loại bỏ marker, hướng dẫn gõ tiếp và các dòng trống."
+        )
         self.spin_smooth_min_words = QSpinBox()
         self.spin_smooth_min_words.setRange(0, 10_000_000)
         self.spin_smooth_min_words.setValue(0)
@@ -810,6 +823,7 @@ class GeminiView(QWidget):
                     batch.account_id = None
                     batch.result_path = None
                     batch.error_message = None
+                    batch.retry_count = 0
                     logging.info("[Gemini UI] Reset batch id=%s country=%s về PENDING", batch.id, country)
                 else:
                     created += 1
@@ -868,7 +882,15 @@ class GeminiView(QWidget):
             status_item.setForeground(QColor(self.STATUS_COLORS.get(batch.status, "#e5e7eb")))
             status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.table_queue.setItem(row, 4, status_item)
-            detail = batch.result_path if batch.status == "SUCCESS" else (batch.error_message or "")
+            if batch.status == "SUCCESS":
+                detail = batch.result_path
+            elif batch.status == "PENDING" and (batch.retry_count or 0) > 0:
+                detail = (
+                    f"Retry {batch.retry_count}/{GEMINI_MAX_RETRIES} đang chờ; "
+                    f"lỗi gần nhất: {batch.error_message or ''}"
+                )
+            else:
+                detail = batch.error_message or ""
             detail_item = QTableWidgetItem(detail or "")
             detail_item.setToolTip(detail or "")
             self.table_queue.setItem(row, 5, detail_item)
@@ -954,6 +976,11 @@ class GeminiView(QWidget):
         self.is_paused = False
         self.account_cursor = 0
         self.session_skipped_account_ids.clear()
+        self.retry_last_account_ids = {
+            batch.id: batch.account_id
+            for batch in batches
+            if (batch.retry_count or 0) > 0 and batch.account_id
+        }
         self.no_pro_accounts_notified = False
         self.btn_run.setEnabled(False)
         self.btn_run_selected.setEnabled(False)
@@ -1007,26 +1034,55 @@ class GeminiView(QWidget):
                     "Các batch còn lại được giữ ở trạng thái PENDING.",
                 )
             return
-        max_workers = min(self.spin_threads.value(), len(accounts))
+        # window_slot_count được cố định khi bắt đầu phiên để vị trí Chrome không
+        # thay đổi giữa các batch. Một worker có thể báo account không dùng được
+        # Pro trước khi thread đóng hẳn, nên vẫn chiếm slot trong chốc lát.
+        max_workers = min(
+            self.spin_threads.value(), len(accounts), self.window_slot_count
+        )
         used_account_ids = {worker.account_id for worker in active_workers}
         used_window_slots = {worker.window_slot for worker in active_workers}
         while self.task_queue and len(active_workers) < max_workers:
+            window_slot = next(
+                (
+                    slot for slot in range(self.window_slot_count)
+                    if slot not in used_window_slots
+                ),
+                None,
+            )
+            if window_slot is None:
+                logging.debug(
+                    "[Gemini UI] Chờ worker cũ đóng để giải phóng window slot; "
+                    "slots_đang_dùng=%s/%s; queue_còn=%s",
+                    sorted(used_window_slots), self.window_slot_count,
+                    len(self.task_queue),
+                )
+                break
             selected_account = None
             selected_index = None
-            for offset in range(len(accounts)):
-                index = (self.account_cursor + offset) % len(accounts)
-                if accounts[index].id not in used_account_ids:
-                    selected_account = accounts[index]
+            queue_index = None
+            # Batch retry ưu tiên Chrome/account khác với lần vừa lỗi. Nếu Chrome
+            # đó đang bận, xét batch kế tiếp thay vì chặn toàn bộ hàng chờ.
+            for candidate_queue_index, candidate_batch_id in enumerate(self.task_queue):
+                previous_account_id = self.retry_last_account_ids.get(candidate_batch_id)
+                for offset in range(len(accounts)):
+                    index = (self.account_cursor + offset) % len(accounts)
+                    account = accounts[index]
+                    if account.id in used_account_ids:
+                        continue
+                    if len(accounts) > 1 and account.id == previous_account_id:
+                        continue
+                    selected_account = account
                     selected_index = index
+                    queue_index = candidate_queue_index
                     break
-            if selected_account is None:
+                if selected_account is not None:
+                    break
+            if selected_account is None or queue_index is None:
                 break
             self.account_cursor = (selected_index + 1) % len(accounts)
-            batch_id = self.task_queue.pop(0)
-            window_slot = next(
-                slot for slot in range(self.window_slot_count)
-                if slot not in used_window_slots
-            )
+            batch_id = self.task_queue.pop(queue_index)
+            self.retry_last_account_ids.pop(batch_id, None)
             logging.info(
                 "[Gemini UI] Round-robin assign batch_id=%s -> account_id=%s email=%s "
                 "position=%s; cursor_next=%s; queue_còn=%s; account_đang_dùng=%s; window_slot=%s/%s",
@@ -1042,12 +1098,15 @@ class GeminiView(QWidget):
             worker.part_progress.connect(self._on_continuation)
             worker.batch_finished.connect(self._on_finished)
             worker.error.connect(self._on_error)
+            worker.retry_requested.connect(self._on_retry_requested)
             worker.account_unavailable.connect(self._on_account_unavailable)
             self.workers.append(worker)
             active_workers.append(worker)
             used_account_ids.add(selected_account.id)
             used_window_slots.add(window_slot)
-            self._set_row(batch_id, account=selected_account.email, status="RUNNING")
+            self._set_row(
+                batch_id, account=selected_account.email, status="RUNNING", detail=""
+            )
             worker.start()
         self.active_workers_count = len(active_workers)
         self._update_stats()
@@ -1132,8 +1191,14 @@ class GeminiView(QWidget):
         batches = query.order_by(GeminiBatch.id.asc()).all()
         for batch in batches:
             batch.status = "PENDING"
+            batch.account_id = None
+            batch.current_part = 0
+            batch.error_message = None
+            batch.retry_count = 0
         db.commit()
         ids = [batch.id for batch in batches]
+        for batch_id in ids:
+            self.retry_last_account_ids.pop(batch_id, None)
         logging.info(
             "[Gemini UI] Chạy lại lỗi; selected_ids=%s; failed_batch_ids=%s",
             selected_ids, ids,
@@ -1177,6 +1242,23 @@ class GeminiView(QWidget):
     def _on_error(self, batch_id, message):
         logging.error("[Gemini UI] Batch id=%s error=%s", batch_id, message)
         self._set_row(batch_id, status="FAILED", detail=message)
+        QTimer.singleShot(0, self.process_queue)
+
+    def _on_retry_requested(self, batch_id, account_id, retry_number, message):
+        self.retry_last_account_ids[batch_id] = account_id
+        if batch_id not in self.task_queue:
+            self.task_queue.append(batch_id)
+        detail = (
+            f"Retry {retry_number}/{GEMINI_MAX_RETRIES}; "
+            f"đã đưa về cuối queue sau lỗi: {message}"
+        )
+        logging.warning(
+            "[Gemini UI] Retry batch id=%s lần %s/%s; "
+            "tránh account id=%s ở lượt kế; queue=%s",
+            batch_id, retry_number, GEMINI_MAX_RETRIES,
+            account_id, self.task_queue,
+        )
+        self._set_row(batch_id, account="—", status="PENDING", detail=detail)
         QTimer.singleShot(0, self.process_queue)
 
     def _on_account_unavailable(self, batch_id, account_id, message):

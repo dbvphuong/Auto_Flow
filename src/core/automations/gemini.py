@@ -6,6 +6,13 @@ import logging
 from common.gemini_languages import LANGUAGE_BY_COUNTRY
 
 
+COMPLETED_PARTS_PATTERN = re.compile(
+    r"Đã[ \t]+hoàn[ \t]+thành[ \t]+(?P<part_count>\d+)"
+    r"[ \t]*/[ \t]*(?P=part_count)[ \t]+part\b",
+    re.IGNORECASE,
+)
+
+
 class GeminiStopped(Exception):
     """Raised when the owning worker asks the automation to stop."""
 
@@ -17,6 +24,23 @@ class GeminiProUnavailable(Exception):
 def _safe_file_name(value):
     value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value or "gemini_story")
     return value.strip(" .") or "gemini_story"
+
+
+def _completion_marker(text, done_marker):
+    """Return the marker that proves Gemini completed all requested parts."""
+    if done_marker:
+        marker_match = re.search(re.escape(done_marker), text, re.IGNORECASE)
+        if marker_match:
+            return marker_match.group(0)
+    match = COMPLETED_PARTS_PATTERN.search(text)
+    return match.group(0) if match else None
+
+
+def _remove_completion_markers(text, done_marker):
+    """Remove control markers from the story saved for the user."""
+    if done_marker:
+        text = re.sub(re.escape(done_marker), "", text, flags=re.IGNORECASE)
+    return COMPLETED_PARTS_PATTERN.sub("", text)
 
 
 def _wait_for_control(config):
@@ -256,11 +280,12 @@ def run_gemini(context, account, prompt, task_id, config):
         page, prompt.strip(), config, stage="Cốt truyện / Hook-Part 1"
     ))
     combined_text = "\n\n".join(story_parts)
+    completion_marker = _completion_marker(combined_text, done_marker)
     logging.info(
         "[Gemini Web][Batch %s] Nội dung đầu: phần=%s; tổng ký tự=%s; marker_found=%s",
-        task_id, len(story_parts), len(combined_text), done_marker in combined_text,
+        task_id, len(story_parts), len(combined_text), bool(completion_marker),
     )
-    if done_marker not in combined_text:
+    if not completion_marker:
         for continuation_number in range(1, max_continuations + 1):
             logging.info(
                 "[Gemini Web][Batch %s] Gửi '1' lần %s/%s",
@@ -278,15 +303,16 @@ def run_gemini(context, account, prompt, task_id, config):
             story_parts.append(response)
             part_callback(continuation_number, max_continuations)
             combined_text = "\n\n".join(story_parts)
+            completion_marker = _completion_marker(combined_text, done_marker)
             logging.info(
                 "[Gemini Web][Batch %s] Sau lần %s: response ký tự=%s; tổng phần=%s; tổng ký tự=%s; marker_found=%s",
                 task_id, continuation_number, len(response), len(story_parts),
-                len(combined_text), done_marker in combined_text,
+                len(combined_text), bool(completion_marker),
             )
-            if done_marker in combined_text:
+            if completion_marker:
                 logging.info(
                     "[Gemini Web][Batch %s] Gặp marker %r sau %s lần gõ '1'",
-                    task_id, done_marker, continuation_number,
+                    task_id, completion_marker, continuation_number,
                 )
                 break
         else:
@@ -305,7 +331,9 @@ def run_gemini(context, account, prompt, task_id, config):
     temp_path = result_path + ".tmp"
     with open(temp_path, "w", encoding="utf-8-sig", newline="\n") as output_file:
         # Marker chỉ dùng điều khiển vòng lặp, không ghi vào nội dung truyện cuối.
-        final_text = "\n\n".join(story_parts).replace(done_marker, "").strip()
+        final_text = _remove_completion_markers(
+            "\n\n".join(story_parts), done_marker
+        ).strip()
         output_file.write(final_text + "\n")
     os.replace(temp_path, result_path)
     logging.info(

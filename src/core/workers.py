@@ -12,10 +12,28 @@ from .automations.video_fx import run_video_fx
 from .browser_manager import parse_proxy
 from .system_config import load_system_config
 
+GEMINI_MAX_RETRIES = 3
+AUTOMATION_MAX_RETRIES = 3
+
+
+def _can_retry_flow_task(error_message):
+    """Không tạo lại khi request cũ có thể vẫn chạy hoặc kết quả đã được tạo."""
+    message = (error_message or "").lower()
+    no_retry_markers = (
+        "không tự retry",
+        "không tự gửi lại",
+        "không thể tải ảnh",
+        "không thể tải video",
+        "timeout chờ tải ảnh",
+        "timeout chờ tải video",
+    )
+    return not any(marker in message for marker in no_retry_markers)
+
 class AutomationWorker(QThread):
     progress = pyqtSignal(int, str) # task_id, status
     task_finished = pyqtSignal(int, str) # task_id, result_path
     error = pyqtSignal(int, str) # task_id, error_msg
+    retry_requested = pyqtSignal(int, int, int, str)
 
     def __init__(self, task_id, target="labs.google/fx", config=None, account_id=None):
         super().__init__()
@@ -120,6 +138,7 @@ class AutomationWorker(QThread):
                 # Assuming result is a path to the generated image
                 task.status = "COMPLETED"
                 task.result_path = result if result else "Lỗi khi lưu kết quả"
+                task.retry_count = 0
                 db.commit()
                 logging.info(f"[Worker {self.task_id}] Hoàn thành task. Kết quả: {task.result_path}")
                 
@@ -128,7 +147,17 @@ class AutomationWorker(QThread):
         except Exception as e:
             err_msg = str(e)
             logging.error(f"[Worker {self.task_id}] Lỗi trong tiến trình chạy automation: {err_msg}")
-            task.status = "PENDING" if self._is_stopped else "ERROR"
+            retries_done = task.retry_count or 0
+            should_retry = (
+                not self._is_stopped
+                and retries_done < AUTOMATION_MAX_RETRIES
+                and _can_retry_flow_task(err_msg)
+            )
+
+            if self._is_stopped or should_retry:
+                task.status = "PENDING"
+            else:
+                task.status = "ERROR"
             
             # Nếu lỗi do tài khoản bị đăng xuất → đánh dấu cookie đã hết hạn trong DB
             if "Tài khoản đã bị đăng xuất" in err_msg or "Signed out" in err_msg:
@@ -139,7 +168,23 @@ class AutomationWorker(QThread):
             db.commit()
             if self._is_stopped:
                 self.progress.emit(self.task_id, "PENDING")
+            elif should_retry:
+                retry_number = retries_done + 1
+                task.retry_count = retry_number
+                db.commit()
+                logging.warning(
+                    "[Worker %s] Retry %s/%s; trả task về queue để chạy bằng "
+                    "Chrome kế tiếp",
+                    self.task_id, retry_number, AUTOMATION_MAX_RETRIES,
+                )
+                self.retry_requested.emit(
+                    self.task_id, account.id, retry_number, err_msg
+                )
             else:
+                if retries_done >= AUTOMATION_MAX_RETRIES:
+                    err_msg = (
+                        f"Đã retry {retries_done}/{AUTOMATION_MAX_RETRIES} lần: {err_msg}"
+                    )
                 self.error.emit(self.task_id, err_msg)
         finally:
             if context:
@@ -155,6 +200,7 @@ class GeminiWorker(QThread):
     part_progress = pyqtSignal(int, int, int)
     batch_finished = pyqtSignal(int, str)
     error = pyqtSignal(int, str)
+    retry_requested = pyqtSignal(int, int, int, str)
     account_unavailable = pyqtSignal(int, int, str)
 
     def __init__(self, batch_id, account_id, config=None, window_slot=0, window_count=1):
@@ -287,6 +333,7 @@ class GeminiWorker(QThread):
                 batch.status = "SUCCESS"
                 batch.result_path = result
                 batch.error_message = None
+                batch.retry_count = 0
                 db.commit()
                 logging.info(
                     "[Gemini Worker %s] SUCCESS; result=%s; account=%s",
@@ -313,10 +360,32 @@ class GeminiWorker(QThread):
         except Exception as exc:
             message = str(exc)
             logging.exception(f"[Gemini {self.batch_id}] Automation failed")
-            batch.status = "FAILED"
             batch.error_message = message
-            db.commit()
-            self.error.emit(self.batch_id, message)
+            retries_done = batch.retry_count or 0
+            if retries_done < GEMINI_MAX_RETRIES:
+                retry_number = retries_done + 1
+                batch.retry_count = retry_number
+                batch.status = "PENDING"
+                db.commit()
+                logging.warning(
+                    "[Gemini Worker %s] Retry %s/%s; đưa batch về queue để chạy "
+                    "bằng Chrome kế tiếp",
+                    self.batch_id, retry_number, GEMINI_MAX_RETRIES,
+                )
+                self.retry_requested.emit(
+                    self.batch_id, self.account_id, retry_number, message
+                )
+            else:
+                batch.status = "FAILED"
+                db.commit()
+                logging.error(
+                    "[Gemini Worker %s] FAILED sau %s lần retry",
+                    self.batch_id, retries_done,
+                )
+                self.error.emit(
+                    self.batch_id,
+                    f"Đã retry {retries_done}/{GEMINI_MAX_RETRIES} lần: {message}",
+                )
         finally:
             if context:
                 try:
