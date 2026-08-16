@@ -4,6 +4,7 @@ import random
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -13,7 +14,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from mutagen.mp3 import MP3
-from PIL import Image
+from PIL import Image, ImageOps
 
 
 QUALITIES = {"1080P": (1920, 1080), "2K": (2560, 1440), "4K": (3840, 2160)}
@@ -409,42 +410,169 @@ def _render_profile(ffmpeg):
     return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "19"], "CPU x264 (Veryfast)", 1
 
 
-def _motion_filter(width, height, start_zoom, end_zoom, frames, fps, centered=False):
-    """Build a CFR, sub-pixel zoom filter for one still-image span.
+def _filter_thread_budget(parallel_jobs):
+    """Split the CPUs reserved for rendering between concurrent FFmpeg jobs."""
+    logical_cpus = os.cpu_count() or 4
+    usable_threads = max(1, logical_cpus // 4)
+    return max(1, usable_threads // max(1, parallel_jobs))
 
-    zoompan rounds its crop origin to whole source pixels.  A centered crop moves
-    on both axes, so those rounding steps are visible as small shakes even when
-    frame timestamps are perfectly regular.  perspective samples at 1/256-pixel
-    precision and cubic interpolation, which keeps both the scale and center
-    continuous without rendering a huge intermediate image.
+
+def _limit_ffmpeg_cpu(process):
+    """Reserve most CPU capacity for the UI while hardware encoding is active.
+
+    FFmpeg's ``-threads`` only controls selected codecs and filters can still
+    create extra workers. A shared Windows affinity mask keeps the combined
+    load bounded even when two hardware-encoder jobs run concurrently.
     """
+    if sys.platform != "win32":
+        return
+    logical_cpus = min(os.cpu_count() or 1, 64)
+    allowed_cpus = max(1, logical_cpus // 4)
+    affinity_mask = (1 << allowed_cpus) - 1
+    try:
+        import ctypes
+
+        ctypes.windll.kernel32.SetProcessAffinityMask(
+            int(process._handle), ctypes.c_size_t(affinity_mask)
+        )
+    except (AttributeError, OSError, ValueError):
+        # Thread flags below remain a useful soft limit on non-standard hosts.
+        pass
+
+
+def _run_ffmpeg(command, *, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=None):
+    """Run a render command with a hard CPU cap and low process priority."""
+    creationflags = 0
+    if sys.platform == "win32":
+        creationflags = subprocess.CREATE_NO_WINDOW | subprocess.BELOW_NORMAL_PRIORITY_CLASS
+    process = subprocess.Popen(
+        command, stdout=stdout, stderr=stderr, creationflags=creationflags
+    )
+    _limit_ffmpeg_cpu(process)
+    try:
+        output, error = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        raise
+    return subprocess.CompletedProcess(command, process.returncode, output, error)
+
+
+def _motion_thread_budget():
+    """OpenCV reaches peak throughput before using all cores on this workload."""
+    return max(1, min(4, (os.cpu_count() or 4) // 4))
+
+
+def _prepare_motion_frame(image_path, width, height):
+    """Decode and cover-crop a still image once instead of once per video frame."""
+    import numpy as np
+
+    with Image.open(image_path) as source:
+        source = ImageOps.exif_transpose(source).convert("RGB")
+        scale = max(width / source.width, height / source.height)
+        scaled_width = max(width, round(source.width * scale))
+        scaled_height = max(height, round(source.height * scale))
+        source = source.resize((scaled_width, scaled_height), Image.Resampling.LANCZOS)
+        left = (scaled_width - width) // 2
+        top = (scaled_height - height) // 2
+        source = source.crop((left, top, left + width, top + height))
+        return np.ascontiguousarray(np.asarray(source, dtype=np.uint8))
+
+
+def _render_affine_motion(
+    ffmpeg, image_path, output_path, width, height, start_zoom, end_zoom,
+    frames, fps, encoder_arguments, centered=False, audio_path=None,
+    cancelled=None,
+):
+    """Render continuous sub-pixel zoom with OpenCV and stream it to FFmpeg.
+
+    A uniform affine transform is substantially cheaper than FFmpeg's general
+    four-corner perspective filter. The source is resized only once, and the
+    encoder still runs in hardware through Quick Sync when available.
+    """
+    import cv2
+    import numpy as np
+
+    cv2.setNumThreads(_motion_thread_budget())
+    base_frame = _prepare_motion_frame(image_path, width, height)
+    yuv = cv2.cvtColor(base_frame, cv2.COLOR_RGB2YUV_I420).reshape(-1)
+    luma_size = width * height
+    chroma_size = luma_size // 4
+    base_y = yuv[:luma_size].reshape(height, width)
+    base_u = yuv[luma_size:luma_size + chroma_size].reshape(height // 2, width // 2)
+    base_v = yuv[luma_size + chroma_size:].reshape(height // 2, width // 2)
+    command = [
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "rawvideo", "-pixel_format", "nv12",
+        "-video_size", f"{width}x{height}", "-framerate", str(fps),
+        "-i", "pipe:0",
+    ]
+    if audio_path is not None:
+        command.extend(["-i", str(audio_path), "-map", "0:v:0", "-map", "1:a:0"])
+    command.extend(["-frames:v", str(frames), *encoder_arguments])
+    if audio_path is not None:
+        command.extend(["-c:a", "aac", "-b:a", "192k", "-shortest"])
+    command.append(str(output_path))
+
+    creationflags = 0
+    if sys.platform == "win32":
+        creationflags = subprocess.CREATE_NO_WINDOW | subprocess.BELOW_NORMAL_PRIORITY_CLASS
+    process = subprocess.Popen(
+        command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, creationflags=creationflags,
+    )
+    _limit_ffmpeg_cpu(process)
     start_zoom = max(1.0, float(start_zoom))
     end_zoom = max(1.0, float(end_zoom))
-    progress = "0" if frames <= 1 else f"(on-1)/{frames - 1}"
-    zoom = f"({start_zoom:.8f}+({end_zoom:.8f}-{start_zoom:.8f})*{progress})"
-
-    if centered:
-        inset_x = f"(W-W/{zoom})/2"
-        inset_y = f"(H-H/{zoom})/2"
-        corners = (
-            f"x0='{inset_x}':y0='{inset_y}':"
-            f"x1='W-({inset_x})':y1='{inset_y}':"
-            f"x2='{inset_x}':y2='H-({inset_y})':"
-            f"x3='W-({inset_x})':y3='H-({inset_y})'"
-        )
-    else:
-        corners = (
-            "x0='0':y0='0':"
-            f"x1='W/{zoom}':y1='0':"
-            f"x2='0':y2='H/{zoom}':"
-            f"x3='W/{zoom}':y3='H/{zoom}'"
-        )
-
-    return (
-        f"scale={width}:{height}:flags=lanczos:force_original_aspect_ratio=increase,"
-        f"crop={width}:{height},fps={fps},"
-        f"perspective={corners}:sense=source:eval=frame:interpolation=cubic,format=yuv420p"
-    )
+    anchor_x = width / 2 if centered else 0.0
+    anchor_y = height / 2 if centered else 0.0
+    error_output = b""
+    try:
+        for index in range(frames):
+            if cancelled and cancelled():
+                raise InterruptedError("ÄÃ£ dá»«ng theo yÃªu cáº§u.")
+            progress = index / (frames - 1) if frames > 1 else 0.0
+            zoom = start_zoom + (end_zoom - start_zoom) * progress
+            matrix = np.array([
+                [zoom, 0.0, (1.0 - zoom) * anchor_x],
+                [0.0, zoom, (1.0 - zoom) * anchor_y],
+            ], dtype=np.float32)
+            chroma_matrix = matrix.copy()
+            chroma_matrix[:, 2] *= 0.5
+            frame_y = cv2.warpAffine(
+                base_y, matrix, (width, height), flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REPLICATE,
+            )
+            frame_u = cv2.warpAffine(
+                base_u, chroma_matrix, (width // 2, height // 2),
+                flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
+            )
+            frame_v = cv2.warpAffine(
+                base_v, chroma_matrix, (width // 2, height // 2),
+                flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
+            )
+            frame_uv = np.empty((height // 2, width), dtype=np.uint8)
+            frame_uv[:, 0::2] = frame_u
+            frame_uv[:, 1::2] = frame_v
+            process.stdin.write(frame_y.data)
+            process.stdin.write(frame_uv.data)
+        process.stdin.close()
+        process.stdin = None
+        error_output, _ = process.communicate()
+    except InterruptedError:
+        process.kill()
+        process.communicate()
+        raise
+    except (BrokenPipeError, OSError):
+        if process.stdin:
+            process.stdin.close()
+            process.stdin = None
+        error_output, _ = process.communicate()
+    except BaseException:
+        process.kill()
+        process.communicate()
+        raise
+    return subprocess.CompletedProcess(command, process.returncode, error_output, None)
 
 
 def render_pairs(name, output_folder, pairs, motions, quality, fps=30, progress=None, cancelled=None,
@@ -464,11 +592,22 @@ def render_pairs(name, output_folder, pairs, motions, quality, fps=30, progress=
     temp_dir = Path(tempfile.mkdtemp(prefix=".capcut_render_", dir=output_folder))
     log_path = output_folder / "capcut_export.log"
     encoder_arguments, encoder_label, parallel_jobs = _render_profile(str(ffmpeg))
-    cpu_arguments = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "19"]
+    # OpenCV already parallelizes each affine transform; multiple simultaneous
+    # raw-frame streams only contend for memory bandwidth and do not render faster.
+    parallel_jobs = 1
+    filter_threads = _filter_thread_budget(parallel_jobs)
+    cpu_arguments = [
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "19",
+        "-threads", str(filter_threads),
+    ]
     actual_encoders = set()
     try:
         with open(log_path, "w", encoding="utf-8") as log:
-            log.write(f"Encoder: {encoder_label}\nFPS: {fps}\nParallel segments: {parallel_jobs}\n")
+            log.write(
+                f"Encoder: {encoder_label}\nFPS: {fps}\n"
+                f"Motion engine: OpenCV affine sub-pixel\n"
+                f"Parallel segments: {parallel_jobs}\nOpenCV threads: {_motion_thread_budget()}\n"
+            )
             segments = [None] * len(pairs)
 
             def render_segment(index, pair, motion):
@@ -477,27 +616,19 @@ def render_pairs(name, output_folder, pairs, motions, quality, fps=30, progress=
                 segment = temp_dir / f"segment_{index:04d}.mp4"
                 frames = max(1, round(pair["duration"] / 1_000_000 * fps))
                 start, end = motion
-                video_filter = _motion_filter(
-                    width, height, start, end, frames, fps, smooth_zoom
-                )
                 attempts = [(encoder_arguments, encoder_label)]
                 if encoder_label != "CPU x264 (Veryfast)":
                     attempts.append((cpu_arguments, "CPU x264 fallback"))
                 errors = []
                 for current_arguments, current_label in attempts:
-                    command = [
-                        ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-loop", "1",
-                        "-framerate", str(fps), "-i", pair["img_path"],
-                        "-i", pair["mp3_path"], "-vf", video_filter, "-map", "0:v", "-map", "1:a",
-                        "-t", f"{pair['duration'] / 1_000_000:.6f}", *current_arguments,
-                        "-c:a", "aac", "-b:a", "192k", "-shortest", str(segment),
-                    ]
-                    result = subprocess.run(
-                        command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        creationflags=0x08000000,
+                    result = _render_affine_motion(
+                        ffmpeg, pair["img_path"], segment, width, height,
+                        start, end, frames, fps, current_arguments,
+                        centered=smooth_zoom, audio_path=pair["mp3_path"],
+                        cancelled=cancelled,
                     )
                     if result.returncode == 0:
-                        return index, segment, "", current_label
+                        return index, segment, "", f"{current_label} + OpenCV affine"
                     errors.append(result.stdout.decode("utf-8", errors="replace"))
                 return index, segment, "\n".join(errors), encoder_label
 
@@ -525,9 +656,9 @@ def render_pairs(name, output_folder, pairs, motions, quality, fps=30, progress=
             with open(concat_file, "w", encoding="utf-8") as handle:
                 for segment in segments:
                     handle.write("file '" + str(segment).replace("'", "'\\''") + "'\n")
-            result = subprocess.run(
+            result = _run_ffmpeg(
                 [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-c", "copy", "-f", "mp4", str(pending)],
-                stdout=log, stderr=subprocess.STDOUT, creationflags=0x08000000,
+                stdout=log,
             )
             if result.returncode:
                 raise RuntimeError(f"FFmpeg không thể ghép video. Xem {log_path}")
@@ -586,7 +717,7 @@ def _read_timeline(path):
     if not isinstance(data, list) or not data:
         raise ValueError("Timeline phải là một mảng JSON không rỗng.")
     entries = []
-    previous_end = -1.0
+    previous_end = None
     for position, item in enumerate(data, 1):
         if not isinstance(item, dict):
             raise ValueError(f"Phần tử #{position} phải là object JSON.")
@@ -610,8 +741,13 @@ def _read_timeline(path):
             raise ValueError(f"Phần tử #{position}: thời gian phải thỏa start ≥ 0, end > start, duration > 0.")
         if abs((end - start) - duration) > 0.15:
             raise ValueError(f"Phần tử #{position}: duration không khớp end - start.")
-        if start < previous_end - 0.001:
-            raise ValueError(f"Phần tử #{position}: timeline bị chồng thời gian hoặc sai thứ tự.")
+        if previous_end is not None and start < previous_end:
+            start = previous_end
+            if end <= start:
+                raise ValueError(
+                    f"Phần tử #{position}: end phải lớn hơn end của phần tử trước ({previous_end:g})."
+                )
+            duration = end - start
         previous_end = end
         entries.append({"start": start, "end": end, "duration": duration, "scene": numeric_scene})
     return entries
@@ -783,7 +919,12 @@ def render_timeline_video(job, quality, fps, zoom, progress=None, cancelled=None
     pending = job.output_path.parent / f".{job.output_path.stem}.{uuid.uuid4().hex}.tmp"
     silent_video = temp_dir / "silent.mp4"
     encoder_arguments, encoder_label, parallel_jobs = _render_profile(str(ffmpeg))
-    cpu_arguments = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "19"]
+    parallel_jobs = 1
+    filter_threads = _filter_thread_budget(parallel_jobs)
+    cpu_arguments = [
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "19",
+        "-threads", str(filter_threads),
+    ]
     actual_encoders = set()
     total_frames = max(1, round(job.audio_duration * fps))
     spans = []
@@ -802,24 +943,18 @@ def render_timeline_video(job, quality, fps, zoom, progress=None, cancelled=None
                 raise InterruptedError("Đã dừng theo yêu cầu.")
             segment = temp_dir / f"segment_{index:05d}.mp4"
             start_zoom, end_zoom = motion
-            video_filter = _motion_filter(
-                width, height, start_zoom, end_zoom, frames, fps, smooth_zoom
-            )
             attempts = [(encoder_arguments, encoder_label)]
             if encoder_label != "CPU x264 (Veryfast)":
                 attempts.append((cpu_arguments, "CPU x264 fallback"))
             error_text = ""
             for arguments, label in attempts:
-                command = [
-                    ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-loop", "1",
-                    "-framerate", str(fps), "-i", image_path, "-vf", video_filter,
-                    "-frames:v", str(frames), "-an", *arguments, str(segment),
-                ]
-                result = subprocess.run(
-                    command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=0x08000000,
+                result = _render_affine_motion(
+                    ffmpeg, image_path, segment, width, height,
+                    start_zoom, end_zoom, frames, fps, arguments,
+                    centered=smooth_zoom, cancelled=cancelled,
                 )
                 if result.returncode == 0:
-                    return index, segment, label, ""
+                    return index, segment, f"{label} + OpenCV affine", ""
                 error_text += result.stdout.decode("utf-8", errors="replace")
             return index, segment, encoder_label, error_text
 
@@ -849,19 +984,17 @@ def render_timeline_video(job, quality, fps, zoom, progress=None, cancelled=None
         with open(concat_file, "w", encoding="utf-8") as handle:
             for segment in segments:
                 handle.write("file '" + str(segment).replace("'", "'\\''") + "'\n")
-        result = subprocess.run(
+        result = _run_ffmpeg(
             [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0",
              "-i", str(concat_file), "-c", "copy", str(silent_video)],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=0x08000000,
         )
         if result.returncode:
             raise RuntimeError("FFmpeg không thể ghép các đoạn ảnh: " + result.stdout.decode("utf-8", errors="replace")[-600:])
-        result = subprocess.run(
+        result = _run_ffmpeg(
             [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(silent_video),
              "-i", str(job.audio_path), "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
              "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart",
              "-f", "mp4", str(pending)],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=0x08000000,
         )
         if result.returncode:
             raise RuntimeError("FFmpeg không thể ghép MP3: " + result.stdout.decode("utf-8", errors="replace")[-600:])

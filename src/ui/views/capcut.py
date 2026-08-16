@@ -484,7 +484,7 @@ class CapcutView(QWidget):
         self.single_fps = QComboBox()
         self.single_fps.addItems(("24 FPS", "25 FPS", "30 FPS", "50 FPS", "60 FPS"))
         self.single_fps.setCurrentText("30 FPS")
-        self.single_smooth_zoom = QCheckBox("Zoom mượt, căn tâm (nội suy sub-pixel)")
+        self.single_smooth_zoom = QCheckBox("Căn tâm (cả hai chế độ đều zoom mượt sub-pixel)")
         export_form.addRow("Folder xuất:", self.single_output)
         export_form.addRow("Độ phân giải:", self.single_quality)
         export_form.addRow("Tốc độ khung hình:", self.single_fps)
@@ -517,7 +517,7 @@ class CapcutView(QWidget):
         self.batch_fps = QComboBox()
         self.batch_fps.addItems(("24 FPS", "25 FPS", "30 FPS", "50 FPS", "60 FPS"))
         self.batch_fps.setCurrentText("30 FPS")
-        self.batch_smooth_zoom = QCheckBox("Zoom mượt, căn tâm (nội suy sub-pixel)")
+        self.batch_smooth_zoom = QCheckBox("Căn tâm (cả hai chế độ đều zoom mượt sub-pixel)")
         form.addRow("Dự án CapCut:", project_row)
         form.addRow("Folder tổng:", self.batch_root)
         form.addRow("Zoom chuyển động:", self.batch_zoom)
@@ -579,7 +579,7 @@ class CapcutView(QWidget):
         self.srt_fps = QComboBox()
         self.srt_fps.addItems(("24 FPS", "25 FPS", "30 FPS", "50 FPS", "60 FPS"))
         self.srt_fps.setCurrentText("30 FPS")
-        self.srt_smooth_zoom = QCheckBox("Zoom mượt, căn tâm (nội suy sub-pixel)")
+        self.srt_smooth_zoom = QCheckBox("Căn tâm (cả hai chế độ đều zoom mượt sub-pixel)")
         quality_fps = QWidget()
         quality_layout = QHBoxLayout(quality_fps)
         quality_layout.setContentsMargins(0, 0, 0, 0)
@@ -998,7 +998,7 @@ class CapcutView(QWidget):
         )
         headers = [
             "STT", "Tên file timeline", "Tên file MP3", "Thời gian xử lý",
-            "Trạng thái", "Đường dẫn kết quả",
+            "Trạng thái", "Đường dẫn kết quả / Chi tiết lỗi",
         ]
         self.result_table.clear()
         self.result_table.setColumnCount(len(headers))
@@ -1011,13 +1011,17 @@ class CapcutView(QWidget):
             "LỖI": "#ef4444", "ĐÃ DỪNG": "#a6adc8",
         }
         for row, record in enumerate(records):
+            status = record.get("status", "")
+            result_text = record.get("result", "")
+            if status == "LỖI" and not result_text:
+                result_text = record.get("detail", "")
             values = [
                 row + 1,
                 record.get("timeline", ""),
                 record.get("mp3", ""),
                 self._format_elapsed(record.get("elapsed", 0)),
-                record.get("status", ""),
-                record.get("result", ""),
+                status,
+                result_text,
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
@@ -1025,6 +1029,8 @@ class CapcutView(QWidget):
                 item.setToolTip(tooltip or str(value))
                 if column == 4:
                     item.setForeground(QColor(colors.get(str(value), "#cdd6f4")))
+                elif column == 5 and status == "LỖI":
+                    item.setForeground(QColor(colors["LỖI"]))
                 self.result_table.setItem(row, column, item)
         header = self.result_table.horizontalHeader()
         for column in (0, 3, 4):
