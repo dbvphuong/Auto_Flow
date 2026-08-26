@@ -702,7 +702,18 @@ def render_project(project_path, project_name, output_folder, quality, fps=30, p
 
 
 def _name_prefix(path):
-    return Path(path).stem.split("_", 1)[0].strip().casefold()
+    path = Path(path)
+    # Folder names may legitimately contain dots (for example
+    # ``5.Anh_full_prompt_anh``). Path.stem treats everything after the final
+    # dot as a suffix even for a directory, reducing that name to ``5``.
+    # Only strip a suffix from files; preserve the complete directory name.
+    name = path.name if path.is_dir() else path.stem
+    return name.split("_", 1)[0].strip().casefold()
+
+
+def _name_stem(path):
+    """Return the complete filename without its extension for exact media pairing."""
+    return Path(path).stem.strip().casefold()
 
 
 def _read_timeline(path):
@@ -822,27 +833,29 @@ def prepare_timeline_video_jobs(timeline_files, audio_files, image_folder, outpu
         if not path.is_file() or path.suffix.lower() != ".json":
             errors.append((path.name, "File timeline không tồn tại hoặc không phải JSON."))
             continue
-        timeline_groups.setdefault(_name_prefix(path), []).append(path)
+        timeline_groups.setdefault(_name_stem(path), []).append(path)
     for path in audios:
         if not path.is_file() or path.suffix.lower() != ".mp3":
             errors.append((path.name, "File MP3 không tồn tại hoặc sai định dạng."))
             continue
-        audio_groups.setdefault(_name_prefix(path), []).append(path)
+        audio_groups.setdefault(_name_stem(path), []).append(path)
 
-    all_prefixes = sorted(set(timeline_groups) | set(audio_groups), key=natural_key)
+    all_names = sorted(set(timeline_groups) | set(audio_groups), key=natural_key)
     seen_outputs = set()
-    for prefix in all_prefixes:
-        timeline_group, audio_group = timeline_groups.get(prefix, []), audio_groups.get(prefix, [])
-        label = prefix or "(không có tiền tố)"
+    for name in all_names:
+        timeline_group, audio_group = timeline_groups.get(name, []), audio_groups.get(name, [])
+        label = name or "(tên trống)"
         if len(timeline_group) != 1 or len(audio_group) != 1:
             errors.append((
                 label,
-                f"Cần đúng 1 timeline và 1 MP3 cùng tiền tố; hiện có {len(timeline_group)} timeline / {len(audio_group)} MP3.",
+                f"Cần đúng 1 timeline JSON và 1 MP3 cùng tên (chỉ khác phần mở rộng); "
+                f"hiện có {len(timeline_group)} timeline / {len(audio_group)} MP3.",
             ))
             continue
         timeline_path, audio_path = timeline_group[0], audio_group[0]
         try:
-            image_folders = image_groups.get(prefix, [])
+            image_prefix = _name_prefix(timeline_path)
+            image_folders = image_groups.get(image_prefix, [])
             if not image_folders:
                 raise ValueError(
                     f"Không tìm thấy folder ảnh con có tiền tố ‘{timeline_path.stem.split('_', 1)[0]}’."

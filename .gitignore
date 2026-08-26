@@ -59,6 +59,7 @@ src/ui/views/*.txt
 # Generated output
 output/
 output_test/
+Test/
 
 # Chrome profiles contain cookies, sessions, history and large browser caches
 data/profiles/

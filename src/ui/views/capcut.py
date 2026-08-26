@@ -595,7 +595,8 @@ class CapcutView(QWidget):
         layout.addWidget(settings)
 
         note = QLabel(
-            "Ghép JSON ↔ MP3 ↔ folder ảnh con bằng phần tên trước dấu “_”. "
+            "JSON và MP3 phải cùng toàn bộ tên file, chỉ khác đuôi .json/.mp3. "
+            "Folder ảnh con được ghép bằng phần tên trước dấu “_”. "
             "Trong folder ảnh, tên 002_* sẽ khớp với scene 2; ảnh _2K được ưu tiên."
         )
         note.setWordWrap(True)

@@ -648,7 +648,7 @@ class GeminiView(QWidget):
 
         for source_path in source_files:
             source_name = os.path.basename(source_path)
-            target_name = f"{path_number}_{source_name}"
+            target_name = f"{path_number}.{source_name}"
             target_path = os.path.join(output_dir, target_name)
 
             if os.path.exists(target_path):
@@ -709,7 +709,7 @@ class GeminiView(QWidget):
             "=" * 48,
             f"Folder nguồn : {source_dir}",
             f"Folder đích  : {output_dir}",
-            f"Tiền tố số  : {path_number}_",
+            f"Tiền tố số  : {path_number}.",
             f"Số từ tối thiểu: {minimum_words:,}",
             "",
             f"Tổng file .txt         : {len(source_files)}",
