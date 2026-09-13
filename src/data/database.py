@@ -85,6 +85,23 @@ def init_db():
                 import logging
                 logging.error(f"[DB] Lỗi khi thêm cột is_gemini: {e}")
 
+    # Urban VPN is opt-in per account. Existing accounts must keep using the
+    # machine's original IP until the user explicitly enables the VPN column.
+    with engine.connect() as conn:
+        try:
+            conn.execute(text("SELECT use_vpn FROM accounts LIMIT 1"))
+        except Exception:
+            try:
+                conn.execute(text(
+                    "ALTER TABLE accounts ADD COLUMN use_vpn BOOLEAN DEFAULT 0"
+                ))
+                conn.commit()
+                import logging
+                logging.info("[DB] Đã nâng cấp schema: Thêm cột use_vpn thành công.")
+            except Exception as e:
+                import logging
+                logging.error(f"[DB] Lỗi khi thêm cột use_vpn: {e}")
+
     # Đảm bảo cột task_type tồn tại trong cơ sở dữ liệu SQLite
     with engine.connect() as conn:
         try:
@@ -134,6 +151,20 @@ def init_db():
             except Exception as e:
                 import logging
                 logging.error(f"[DB] Lỗi khi thêm retry_count cho tasks: {e}")
+
+    # Lưu nguyên văn lỗi của task để UI vẫn hiển thị tooltip sau khi khởi động lại.
+    with engine.connect() as conn:
+        try:
+            conn.execute(text("SELECT error_message FROM tasks LIMIT 1"))
+        except Exception:
+            try:
+                conn.execute(text("ALTER TABLE tasks ADD COLUMN error_message TEXT"))
+                conn.commit()
+                import logging
+                logging.info("[DB] Đã nâng cấp schema: Thêm error_message cho tasks.")
+            except Exception as e:
+                import logging
+                logging.error(f"[DB] Lỗi khi thêm error_message cho tasks: {e}")
 
     # Đảm bảo cột prompts_text tồn tại trong bảng image_sessions
     with engine.connect() as conn:

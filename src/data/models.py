@@ -11,10 +11,13 @@ class Account(Base):
     is_image = Column(Boolean, default=True)
     is_video = Column(Boolean, default=False)
     is_gemini = Column(Boolean, default=False)
+    use_vpn = Column(Boolean, default=False)
     account_type = Column(String, default="FREE") # PRO, FREE
     credits = Column(Integer, default=0)
-    proxy = Column(String, nullable=True) # host:port:user:pass
-    use_proxy = Column(Boolean, default=True)
+    # Legacy columns are kept so existing SQLite databases remain readable.
+    # The application no longer exposes or uses the old string proxy feature.
+    proxy = Column(String, nullable=True)
+    use_proxy = Column(Boolean, default=False)
     chrome_profile = Column(String, default="_tool_profile_")
     cookie_expiry = Column(DateTime, nullable=True)
     cookies_json = Column(String, nullable=True) # Store cookies as JSON string
@@ -34,6 +37,7 @@ class Task(Base):
     task_type = Column(String, default="image")
     session_id = Column(Integer, nullable=True) # Link to image_sessions table
     retry_count = Column(Integer, default=0)
+    error_message = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class ImageSession(Base):

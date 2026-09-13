@@ -10,6 +10,8 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from difflib import get_close_matches
+from fractions import Fraction
 from functools import lru_cache
 from pathlib import Path
 
@@ -17,9 +19,15 @@ from mutagen.mp3 import MP3
 from PIL import Image, ImageOps
 
 
-QUALITIES = {"1080P": (1920, 1080), "2K": (2560, 1440), "4K": (3840, 2160)}
+QUALITIES = {
+    "720P": (1280, 720),
+    "1080P": (1920, 1080),
+    "2K": (2560, 1440),
+    "4K": (3840, 2160),
+}
 FPS_OPTIONS = (24, 25, 30, 50, 60)
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg")
+VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v")
 
 
 @dataclass
@@ -37,6 +45,16 @@ class TimelineVideoJob:
     output_path: Path
     audio_duration: float
     entries: list[dict]
+    media_type: str = "image"
+
+
+@dataclass
+class VideoAudioBatchJob:
+    audio_path: Path
+    video_folder: Path
+    video_paths: list[Path]
+    output_path: Path
+    audio_duration: float
 
 
 def natural_key(value):
@@ -93,7 +111,7 @@ def parse_zoom_settings(minimum, maximum, difference):
 
 def validate_quality(quality):
     if quality not in QUALITIES:
-        raise ValueError("Độ phân giải phải là 1080P, 2K hoặc 4K.")
+        raise ValueError("Độ phân giải phải là 720P, 1080P, 2K hoặc 4K.")
     return quality
 
 
@@ -206,6 +224,8 @@ def build_timeline_video_project(json_path, job):
         "source_timerange": {"start": 0, "duration": audio_duration},
     })
 
+    is_clip_timeline = job.media_type == "video"
+    media_key = "video" if is_clip_timeline else "image"
     for index, entry in enumerate(job.entries):
         start = 0 if index == 0 else round(entry["start"] * 1_000_000)
         end = (
@@ -220,8 +240,8 @@ def build_timeline_video_project(json_path, job):
         })
         materials["canvases"].append({"id": canvas_id, "type": "canvas"})
         materials["videos"].append({
-            "id": video_id, "path": str(entry["image"]),
-            "type": "photo", "duration": duration,
+            "id": video_id, "path": str(entry[media_key]),
+            "type": "video" if is_clip_timeline else "photo", "duration": duration,
         })
         timerange = {"start": start, "duration": duration}
         video_track["segments"].append({
@@ -456,6 +476,586 @@ def _run_ffmpeg(command, *, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, ti
         process.communicate()
         raise
     return subprocess.CompletedProcess(command, process.returncode, output, error)
+
+
+def _media_executable(name):
+    """Return an FFmpeg utility from PATH or the project's Windows fallback."""
+    executable = shutil.which(name)
+    if executable:
+        return executable
+    fallback = Path(
+        r"E:\SETUP\ffmpeg-2026-03-18-git-106616f13d-full_build\bin"
+    ) / f"{name}.exe"
+    if fallback.is_file():
+        return str(fallback)
+    raise RuntimeError(f"Không tìm thấy {name}. Hãy thêm FFmpeg vào PATH.")
+
+
+def _probe_video(path):
+    """Read the stream details needed to normalize videos before joining."""
+    path = Path(path)
+    if not path.is_file() or path.suffix.lower() != ".mp4":
+        raise ValueError(f"File MP4 không hợp lệ: {path}")
+    result = subprocess.run(
+        [
+            _media_executable("ffprobe"), "-v", "error", "-show_streams",
+            "-show_format", "-of", "json", str(path),
+        ],
+        capture_output=True,
+        timeout=30,
+        creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
+    )
+    if result.returncode:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise ValueError(f"Không đọc được video {path.name}: {detail or 'FFprobe báo lỗi'}")
+    try:
+        info = json.loads(result.stdout.decode("utf-8", errors="replace"))
+        video = next(stream for stream in info.get("streams", []) if stream.get("codec_type") == "video")
+        video_duration_value = video.get("duration")
+        if not video_duration_value and video.get("duration_ts") and video.get("time_base"):
+            video_duration_value = float(video["duration_ts"]) * float(Fraction(video["time_base"]))
+        video_duration = float(video_duration_value or info.get("format", {}).get("duration"))
+        duration = float(info.get("format", {}).get("duration") or video_duration)
+        width, height = int(video["width"]), int(video["height"])
+        rate = video.get("avg_frame_rate") or video.get("r_frame_rate") or "30/1"
+        fps = float(Fraction(rate)) if rate != "0/0" else 30.0
+    except (KeyError, StopIteration, TypeError, ValueError, ZeroDivisionError) as exc:
+        raise ValueError(f"Video thiếu thông tin hình ảnh/thời lượng: {path.name}") from exc
+    if duration <= 0 or width <= 0 or height <= 0:
+        raise ValueError(f"Video có thông tin không hợp lệ: {path.name}")
+    return {
+        "path": path,
+        "duration": duration,
+        "video_duration": video_duration,
+        "width": width - (width % 2),
+        "height": height - (height % 2),
+        "fps": min(60.0, max(1.0, fps)),
+        "has_audio": any(
+            stream.get("codec_type") == "audio" for stream in info.get("streams", [])
+        ),
+    }
+
+
+def _normalized_video_filter(input_index, label, width, height, fps, duration=None):
+    trim = f",trim=duration={duration:.6f}" if duration is not None else ""
+    return (
+        f"[{input_index}:v:0]{trim.lstrip(',') + ',' if trim else ''}"
+        f"setpts=PTS-STARTPTS,fps={fps:.6f},"
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+        f"setsar=1,format=yuv420p[{label}]"
+    )
+
+
+def _concat_filter(probes, width, height, fps, include_audio=True, input_offset=0):
+    """Build a concat graph that tolerates mixed sizes, FPS, and missing audio."""
+    filters, inputs = [], []
+    for index, probe in enumerate(probes):
+        input_index = index + input_offset
+        duration = probe["duration"]
+        video_label = f"join_v{index}"
+        filters.append(_normalized_video_filter(input_index, video_label, width, height, fps, duration))
+        inputs.append(f"[{video_label}]")
+        if include_audio:
+            audio_label = f"join_a{index}"
+            if probe["has_audio"]:
+                filters.append(
+                    f"[{input_index}:a:0]aresample=48000:async=1:first_pts=0,"
+                    "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+                    f"apad,atrim=duration={duration:.6f},asetpts=PTS-STARTPTS[{audio_label}]"
+                )
+            else:
+                filters.append(
+                    "anullsrc=r=48000:cl=stereo,"
+                    f"atrim=duration={duration:.6f},asetpts=PTS-STARTPTS[{audio_label}]"
+                )
+            inputs.append(f"[{audio_label}]")
+    outputs = "[joined_v][joined_a]" if include_audio else "[joined_v]"
+    filters.append(
+        "".join(inputs) + f"concat=n={len(probes)}:v=1:a={1 if include_audio else 0}{outputs}"
+    )
+    return ";".join(filters)
+
+
+def _run_cancellable_ffmpeg(command, log_path, cancelled=None):
+    creationflags = 0
+    if sys.platform == "win32":
+        creationflags = subprocess.CREATE_NO_WINDOW | subprocess.BELOW_NORMAL_PRIORITY_CLASS
+    with open(log_path, "ab") as log:
+        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, creationflags=creationflags)
+        _limit_ffmpeg_cpu(process)
+        while True:
+            try:
+                returncode = process.wait(timeout=0.25)
+                return subprocess.CompletedProcess(command, returncode)
+            except subprocess.TimeoutExpired:
+                if cancelled and cancelled():
+                    process.kill()
+                    process.wait()
+                    raise InterruptedError("Đã dừng theo yêu cầu.")
+
+
+def _validate_join_request(video_paths, output_path, minimum=1):
+    paths = [Path(path).resolve() for path in video_paths]
+    if len(paths) < minimum:
+        raise ValueError(f"Hãy chọn ít nhất {minimum} file MP4.")
+    output = Path(output_path).resolve()
+    if output.suffix.lower() != ".mp4":
+        raise ValueError("File output phải có đuôi .mp4.")
+    if output in paths:
+        raise ValueError("File output không được trùng với video đầu vào.")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    return paths, output
+
+
+def _encode_joined_video(input_paths, filter_graph, maps, output_path, cancelled=None):
+    ffmpeg = _media_executable("ffmpeg")
+    pending = output_path.parent / f".{output_path.stem}_{uuid.uuid4().hex}.part.mp4"
+    log_path = output_path.parent / "capcut_video_join.log"
+    encoder_arguments, encoder_label, parallel_jobs = _render_profile(ffmpeg)
+    cpu_arguments = [
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "19",
+        "-threads", str(_filter_thread_budget(1)),
+    ]
+    attempts = [(encoder_arguments, encoder_label)]
+    if encoder_label != "CPU x264 (Veryfast)":
+        attempts.append((cpu_arguments, "CPU x264 fallback"))
+    try:
+        with open(log_path, "w", encoding="utf-8") as log:
+            log.write(f"Inputs: {len(input_paths)}\n")
+        errors = []
+        for encoder, label in attempts:
+            if pending.exists():
+                pending.unlink()
+            command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+            for path in input_paths:
+                command.extend(["-i", str(path)])
+            command.extend(["-filter_complex", filter_graph])
+            for stream_map in maps:
+                command.extend(["-map", stream_map])
+            command.extend([*encoder, "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(pending)])
+            result = _run_cancellable_ffmpeg(command, log_path, cancelled)
+            if result.returncode == 0 and pending.is_file():
+                os.replace(pending, output_path)
+                return output_path, label
+            errors.append(label)
+        raise RuntimeError(
+            f"FFmpeg không thể ghép video ({', '.join(errors)}). Xem log: {log_path}"
+        )
+    finally:
+        if pending.exists():
+            pending.unlink()
+
+
+def merge_videos(video_paths, output_path, progress=None, cancelled=None):
+    """Join MP4 files in the supplied order into one normalized MP4."""
+    paths, output = _validate_join_request(video_paths, output_path, minimum=2)
+    probes = []
+    for index, path in enumerate(paths, 1):
+        if cancelled and cancelled():
+            raise InterruptedError("Đã dừng theo yêu cầu.")
+        probes.append(_probe_video(path))
+        if progress:
+            progress(index, len(paths) + 1)
+    target = probes[0]
+    graph = _concat_filter(probes, target["width"], target["height"], target["fps"], True)
+    result = _encode_joined_video(paths, graph, ("[joined_v]", "[joined_a]"), output, cancelled)
+    if progress:
+        progress(len(paths) + 1, len(paths) + 1)
+    return result
+
+
+def _batch_folder_key(name):
+    """Normalize Windows copy suffixes, e.g. ``name(1)`` -> ``name``."""
+    return re.sub(r"\s*\(\d+\)\s*$", "", str(name)).strip().casefold()
+
+
+def prepare_video_audio_batch_jobs(audio_files, video_root):
+    """Validate and pair MP3 files with direct child video folders.
+
+    Existing sibling MP4 outputs are returned as skipped before folder matching,
+    because they need no further work.
+    """
+    audios = [Path(path).resolve() for path in dict.fromkeys(map(str, audio_files))]
+    root = Path(video_root).resolve()
+    jobs, skipped, errors = [], [], []
+    if not audios:
+        return jobs, skipped, [("MP3", "Hãy chọn ít nhất một file MP3.")]
+    if not root.is_dir():
+        return jobs, skipped, [(
+            "Folder video",
+            f"Folder video gốc không tồn tại hoặc không hợp lệ: {root}",
+        )]
+
+    folder_groups = {}
+    for folder in sorted((path for path in root.iterdir() if path.is_dir()), key=lambda path: natural_key(path.name)):
+        folder_groups.setdefault(_batch_folder_key(folder.name), []).append(folder)
+
+    audio_groups = {}
+    for audio_path in audios:
+        if not audio_path.is_file() or audio_path.suffix.lower() != ".mp3":
+            errors.append((audio_path.name, "File MP3 không hợp lệ."))
+            continue
+        audio_groups.setdefault(audio_path.stem.casefold(), []).append(audio_path)
+
+    for key, matches in audio_groups.items():
+        if len(matches) > 1:
+            errors.append((
+                matches[0].stem,
+                "Có nhiều MP3 trùng tên: " + ", ".join(str(path) for path in matches),
+            ))
+
+    for key, audio_group in sorted(audio_groups.items(), key=lambda item: natural_key(item[0])):
+        if len(audio_group) != 1:
+            continue
+        audio_path = audio_group[0]
+        output_path = audio_path.with_suffix(".mp4")
+        if output_path.exists():
+            skipped.append((audio_path.name, f"Đã tồn tại: {output_path.name}"))
+            continue
+        matches = folder_groups.get(key, [])
+        if not matches:
+            similar_keys = get_close_matches(key, list(folder_groups), n=3, cutoff=0.35)
+            similar_folders = [
+                folder.name for similar_key in similar_keys
+                for folder in folder_groups[similar_key]
+            ]
+            suggestion = (
+                " Folder gần giống đang có: " + ", ".join(similar_folders) + "."
+                if similar_folders else ""
+            )
+            errors.append((
+                audio_path.name,
+                f"Không tìm thấy folder video tương ứng. Cần folder tên "
+                f"‘{audio_path.stem}’ hoặc ‘{audio_path.stem}(1)’ trực tiếp trong: {root}."
+                f"{suggestion}",
+            ))
+            continue
+        if len(matches) > 1:
+            errors.append((
+                audio_path.name,
+                "Có nhiều folder cùng khớp, hãy chỉ giữ/chọn một folder: "
+                + ", ".join(str(folder) for folder in matches),
+            ))
+            continue
+
+        video_folder = matches[0]
+        video_paths = sorted_files(video_folder, (".mp4",))
+        if not video_paths:
+            errors.append((
+                audio_path.name,
+                f"Folder đã khớp nhưng không có file MP4 trực tiếp bên trong: {video_folder}",
+            ))
+            continue
+        try:
+            audio_duration = float(MP3(str(audio_path)).info.length)
+        except Exception as exc:
+            errors.append((audio_path.name, f"Không đọc được thời lượng MP3: {exc}"))
+            continue
+        if audio_duration <= 0:
+            errors.append((audio_path.name, "MP3 có thời lượng không hợp lệ."))
+            continue
+        jobs.append(VideoAudioBatchJob(
+            audio_path=audio_path,
+            video_folder=video_folder,
+            video_paths=video_paths,
+            output_path=output_path,
+            audio_duration=audio_duration,
+        ))
+    return jobs, skipped, errors
+
+
+def _build_video_audio_occurrences(probes, target_duration, rng=None):
+    """Keep the first pass ordered, then append independently shuffled passes."""
+    if not probes:
+        raise ValueError("Folder video không có video hợp lệ.")
+    rng = rng or random.Random()
+    occurrences, elapsed = [], 0.0
+    order = list(range(len(probes)))
+    first_pass = True
+    previous = None
+    while elapsed < target_duration:
+        current_order = order.copy()
+        if not first_pass:
+            rng.shuffle(current_order)
+            if len(current_order) > 1 and current_order[0] == previous:
+                swap_index = next(index for index, value in enumerate(current_order[1:], 1) if value != previous)
+                current_order[0], current_order[swap_index] = current_order[swap_index], current_order[0]
+        for probe_index in current_order:
+            remaining = target_duration - elapsed
+            if remaining <= 0:
+                break
+            duration = min(float(probes[probe_index]["duration"]), remaining)
+            occurrences.append((probe_index, duration))
+            elapsed += duration
+            previous = probe_index
+        first_pass = False
+    return occurrences
+
+
+def _batch_normalize_command(
+    ffmpeg, probe, output_path, width, height, fps, encoder_arguments,
+    include_audio,
+):
+    """Build a bounded-memory command for one normalized source clip."""
+    fps_fraction = Fraction(float(fps)).limit_denominator(1001)
+    fps_value = float(fps_fraction)
+    fps_text = str(fps_fraction)
+    source_duration = float(probe.get("video_duration") or probe["duration"])
+    frames = max(1, round(source_duration * fps_value))
+    duration = frames / fps_value
+    video_filter = (
+        f"setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration={duration:.6f},"
+        f"fps={fps_text},scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+        "setsar=1,format=yuv420p"
+    )
+    command = [
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(probe["path"]),
+    ]
+    if include_audio and not probe["has_audio"]:
+        command.extend(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"])
+    command.extend([
+        "-map", "0:v:0", "-vf", video_filter,
+        "-frames:v", str(frames), "-fps_mode", "cfr",
+        *encoder_arguments, "-pix_fmt", "yuv420p",
+        "-g", str(max(1, round(fps_value * 2))),
+        "-video_track_timescale", "90000",
+    ])
+    if include_audio:
+        audio_input = "0:a:0" if probe["has_audio"] else "1:a:0"
+        command.extend([
+            "-map", audio_input,
+            "-af", (
+                "aresample=48000:async=1:first_pts=0,"
+                "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+                f"apad,atrim=duration={duration:.6f},asetpts=PTS-STARTPTS"
+            ),
+            "-c:a", "pcm_s16le",
+        ])
+    else:
+        command.append("-an")
+    command.extend([
+        "-t", f"{duration:.6f}", "-avoid_negative_ts", "make_zero",
+        "-movflags", "+faststart", str(output_path),
+    ])
+    return command, duration
+
+
+def _write_batch_concat_file(path, normalized_paths, occurrences):
+    """Write an ffconcat schedule; repeated entries do not duplicate media."""
+    lines = ["ffconcat version 1.0"]
+    for probe_index, _ in occurrences:
+        media_path = normalized_paths[probe_index].resolve()
+        try:
+            value = media_path.relative_to(path.parent.resolve()).as_posix()
+        except ValueError:
+            value = str(media_path).replace("\\", "/")
+        value = value.replace("'", "'\\''")
+        lines.append(f"file '{value}'")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _batch_final_command(
+    ffmpeg, concat_path, audio_path, pending, duration, video_volume,
+    include_video_audio,
+):
+    """Stream-copy scheduled video and encode only the final mixed audio."""
+    command = [
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "concat", "-safe", "0", "-i", str(concat_path),
+        "-i", str(audio_path), "-map", "0:v:0", "-c:v", "copy",
+    ]
+    main_audio = (
+        "[1:a:0]aresample=48000:async=1:first_pts=0,"
+        "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+        f"volume=1.000000,apad,atrim=duration={duration:.6f},"
+        "asetpts=PTS-STARTPTS[main_a]"
+    )
+    if include_video_audio:
+        graph = (
+            main_audio + ";"
+            "[0:a:0]aresample=48000:async=1:first_pts=0,"
+            "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+            f"volume={video_volume / 100.0:.6f},apad,atrim=duration={duration:.6f},"
+            "asetpts=PTS-STARTPTS[video_a];"
+            "[main_a][video_a]amix=inputs=2:duration=first:dropout_transition=0:"
+            "normalize=0[out_a]"
+        )
+    else:
+        graph = main_audio + ";[main_a]anull[out_a]"
+    command.extend([
+        "-filter_complex", graph, "-map", "[out_a]",
+        "-c:a", "aac", "-b:a", "192k", "-t", f"{duration:.6f}",
+        "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", str(pending),
+    ])
+    return command
+
+
+def render_video_audio_batch_job(
+    job, video_volume=0, quality="1080P", progress=None, cancelled=None,
+):
+    """Normalize unique clips sequentially, then stream-copy the shuffled schedule."""
+    try:
+        video_volume = float(video_volume)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Âm lượng video phải là số từ 0 đến 100%.") from exc
+    if not 0 <= video_volume <= 100:
+        raise ValueError("Âm lượng video phải nằm trong khoảng 0 đến 100%.")
+    if job.output_path.exists():
+        return job.output_path, None
+
+    probes = []
+    for path in job.video_paths:
+        if cancelled and cancelled():
+            raise InterruptedError("Đã dừng theo yêu cầu.")
+        probes.append(_probe_video(path))
+    target = probes[0]
+    width, height = QUALITIES[validate_quality(quality)]
+    fps = target["fps"]
+    include_video_audio = video_volume > 0 and any(probe["has_audio"] for probe in probes)
+    ffmpeg = _media_executable("ffmpeg")
+    encoder_arguments, encoder_label, _ = _render_profile(ffmpeg)
+    cpu_arguments = [
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "19",
+        "-threads", str(_filter_thread_budget(1)),
+    ]
+    attempts = [(encoder_arguments, encoder_label)]
+    if encoder_label != "CPU x264 (Veryfast)":
+        attempts.append((cpu_arguments, "CPU x264 fallback"))
+
+    job.output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(tempfile.mkdtemp(prefix=".autoflow_video_join_", dir=job.output_path.parent))
+    pending = job.output_path.parent / f".{job.output_path.stem}_{uuid.uuid4().hex}.part.mp4"
+    concat_path = temp_dir / "schedule.ffconcat"
+    log_path = job.output_path.parent / "capcut_video_audio_batch.log"
+    try:
+        with open(log_path, "w", encoding="utf-8") as log:
+            log.write(f"MP3: {job.audio_path}\nVideo folder: {job.video_folder}\n")
+
+        normalized_paths = [temp_dir / f"clip_{index:05d}.mov" for index in range(len(probes))]
+        normalized_probes = None
+        actual_encoder = None
+        failed_encoders = []
+        for encoder, label in attempts:
+            for path in normalized_paths:
+                if path.exists():
+                    path.unlink()
+            current_probes = []
+            for index, (probe, normalized_path) in enumerate(zip(probes, normalized_paths), 1):
+                if cancelled and cancelled():
+                    raise InterruptedError("Đã dừng theo yêu cầu.")
+                command, normalized_duration = _batch_normalize_command(
+                    ffmpeg, probe, normalized_path, width, height, fps,
+                    encoder, include_video_audio,
+                )
+                result = _run_cancellable_ffmpeg(command, log_path, cancelled)
+                if (
+                    result.returncode or not normalized_path.is_file()
+                    or normalized_path.stat().st_size <= 0
+                ):
+                    failed_encoders.append(f"{label} tại clip {probe['path'].name}")
+                    break
+                current_probes.append(dict(probe, duration=normalized_duration, path=normalized_path))
+                if progress:
+                    progress(index, len(probes) + 1)
+            else:
+                normalized_probes = current_probes
+                actual_encoder = label
+                break
+        if normalized_probes is None:
+            raise RuntimeError(
+                "Không thể chuẩn hóa video bằng " + ", ".join(failed_encoders)
+                + f". Xem log chi tiết: {log_path}"
+            )
+
+        rng = random.Random(f"{job.audio_path.stem}|{job.audio_duration:.6f}")
+        occurrences = _build_video_audio_occurrences(
+            normalized_probes, job.audio_duration, rng,
+        )
+        _write_batch_concat_file(concat_path, normalized_paths, occurrences)
+        command = _batch_final_command(
+            ffmpeg, concat_path, job.audio_path, pending, job.audio_duration,
+            video_volume, include_video_audio,
+        )
+        result = _run_cancellable_ffmpeg(command, log_path, cancelled)
+        if result.returncode or not pending.is_file() or pending.stat().st_size <= 0:
+            raise RuntimeError(f"FFmpeg không thể ghép video cuối. Xem log chi tiết: {log_path}")
+        os.replace(pending, job.output_path)
+        if progress:
+            progress(len(probes) + 1, len(probes) + 1)
+        return job.output_path, f"{actual_encoder} + stream copy"
+    finally:
+        if pending.exists():
+            pending.unlink()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def replace_video_intro(
+    source_path, video_paths, output_path, progress=None, cancelled=None,
+    overlay_volume=100,
+):
+    """Replace source visuals and optionally mix sequential overlay clip audio."""
+    try:
+        overlay_volume = float(overlay_volume)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Âm lượng video ghi đè phải là số từ 0 đến 100%.") from exc
+    if not 0 <= overlay_volume <= 100:
+        raise ValueError("Âm lượng video ghi đè phải nằm trong khoảng 0 đến 100%.")
+
+    source = Path(source_path).resolve()
+    if not source.is_file() or source.suffix.lower() != ".mp4":
+        raise ValueError("Hãy chọn video nguồn MP4 hợp lệ.")
+    paths, output = _validate_join_request(video_paths, output_path, minimum=1)
+    if output == source:
+        raise ValueError("File output không được ghi đè trực tiếp lên video nguồn.")
+    source_probe = _probe_video(source)
+    probes = []
+    for index, path in enumerate(paths, 1):
+        if cancelled and cancelled():
+            raise InterruptedError("Đã dừng theo yêu cầu.")
+        probes.append(_probe_video(path))
+        if progress:
+            progress(index, len(paths) + 1)
+    width, height, fps = source_probe["width"], source_probe["height"], source_probe["fps"]
+    mix_overlay_audio = overlay_volume > 0 and any(probe["has_audio"] for probe in probes)
+    cover_graph = _concat_filter(
+        probes, width, height, fps,
+        include_audio=mix_overlay_audio, input_offset=1,
+    )
+    base_filter = _normalized_video_filter(0, "source_v", width, height, fps)
+    graph_parts = [
+        f"{base_filter};{cover_graph};"
+        "[source_v][joined_v]overlay=0:0:eof_action=pass:repeatlast=0:shortest=0,"
+        f"trim=duration={source_probe['duration']:.6f},setpts=PTS-STARTPTS[out_v]"
+    ]
+    maps = ["[out_v]"]
+    if source_probe["has_audio"] and mix_overlay_audio:
+        volume_factor = overlay_volume / 100.0
+        graph_parts.extend([
+            f"[0:a:0]volume=1.000000,apad,atrim=duration={source_probe['duration']:.6f},"
+            "asetpts=PTS-STARTPTS[source_a]",
+            f"[joined_a]volume={volume_factor:.6f},apad,"
+            f"atrim=duration={source_probe['duration']:.6f},asetpts=PTS-STARTPTS[overlay_a]",
+            "[source_a][overlay_a]amix=inputs=2:duration=first:dropout_transition=0:"
+            "normalize=0[out_a]",
+        ])
+        maps.append("[out_a]")
+    elif source_probe["has_audio"]:
+        maps.append("0:a:0")
+    elif mix_overlay_audio:
+        volume_factor = overlay_volume / 100.0
+        graph_parts.append(
+            f"[joined_a]volume={volume_factor:.6f},apad,"
+            f"atrim=duration={source_probe['duration']:.6f},asetpts=PTS-STARTPTS[out_a]"
+        )
+        maps.append("[out_a]")
+    graph = ";".join(graph_parts)
+    result = _encode_joined_video([source, *paths], graph, maps, output, cancelled)
+    if progress:
+        progress(len(paths) + 1, len(paths) + 1)
+    return result
 
 
 def _motion_thread_budget():
@@ -804,6 +1404,35 @@ def _scene_image_map(image_folders):
     return {scene: sorted(paths, key=rank)[0] for scene, paths in candidates.items()}
 
 
+def _scene_video_map(video_folder):
+    video_folder = Path(video_folder)
+    if not video_folder.is_dir():
+        raise ValueError("Folder video không tồn tại.")
+    candidates = {}
+    for path in video_folder.iterdir():
+        if not path.is_file() or path.suffix.lower() not in VIDEO_EXTENSIONS:
+            continue
+        match = re.match(r"^(\d+)(?:\D|$)", path.stem)
+        if match:
+            candidates.setdefault(int(match.group(1)), []).append(path)
+    if not candidates:
+        raise ValueError(
+            "Folder video không có clip MP4/MOV/MKV/AVI/WEBM/M4V bắt đầu bằng số scene."
+        )
+
+    def rank(path):
+        stem = path.stem.casefold()
+        quality = (
+            0 if re.search(r"(?:^|[_-])(?:4k|2160p?)(?:[_-]|$)", stem) else
+            1 if re.search(r"(?:^|[_-])(?:2k|1440p?)(?:[_-]|$)", stem) else
+            2 if re.search(r"(?:^|[_-])1080p?(?:[_-]|$)", stem) else
+            3 if re.search(r"(?:^|[_-])720p?(?:[_-]|$)", stem) else 4
+        )
+        return quality, natural_key(path.name)
+
+    return {scene: sorted(paths, key=rank)[0] for scene, paths in candidates.items()}
+
+
 def _validate_output_folder(folder):
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
@@ -903,6 +1532,88 @@ def prepare_timeline_video_jobs(timeline_files, audio_files, image_folder, outpu
     return jobs, skipped, errors
 
 
+def prepare_timeline_clip_jobs(timeline_files, audio_files, video_folder, output_folder=None):
+    """Validate JSON/MP3 pairs and resolve direct video clips by scene number."""
+    timelines = [Path(path) for path in dict.fromkeys(map(str, timeline_files))]
+    audios = [Path(path) for path in dict.fromkeys(map(str, audio_files))]
+    errors, skipped, jobs = [], [], []
+    if not timelines:
+        return jobs, skipped, [("Timeline", "Chưa chọn file JSON.")]
+    if not audios:
+        return jobs, skipped, [("MP3", "Chưa chọn file MP3.")]
+    try:
+        videos = _scene_video_map(video_folder)
+    except ValueError as exc:
+        return jobs, skipped, [("Folder video", str(exc))]
+
+    timeline_groups, audio_groups = {}, {}
+    for path in timelines:
+        if not path.is_file() or path.suffix.lower() != ".json":
+            errors.append((path.name, "File timeline không tồn tại hoặc không phải JSON."))
+            continue
+        timeline_groups.setdefault(_name_stem(path), []).append(path)
+    for path in audios:
+        if not path.is_file() or path.suffix.lower() != ".mp3":
+            errors.append((path.name, "File MP3 không tồn tại hoặc sai định dạng."))
+            continue
+        audio_groups.setdefault(_name_stem(path), []).append(path)
+
+    all_names = sorted(set(timeline_groups) | set(audio_groups), key=natural_key)
+    seen_outputs = set()
+    for name in all_names:
+        timeline_group, audio_group = timeline_groups.get(name, []), audio_groups.get(name, [])
+        label = name or "(tên trống)"
+        if len(timeline_group) != 1 or len(audio_group) != 1:
+            errors.append((
+                label,
+                f"Cần đúng 1 timeline JSON và 1 MP3 cùng tên (chỉ khác phần mở rộng); "
+                f"hiện có {len(timeline_group)} timeline / {len(audio_group)} MP3.",
+            ))
+            continue
+        timeline_path, audio_path = timeline_group[0], audio_group[0]
+        try:
+            entries = _read_timeline(timeline_path)
+            audio_duration = float(MP3(str(audio_path)).info.length)
+            if audio_duration <= 0:
+                raise ValueError("MP3 không có thời lượng hợp lệ.")
+            if entries[-1]["end"] > audio_duration + 0.25:
+                raise ValueError(
+                    f"Timeline kết thúc ở {entries[-1]['end']:.2f}s, vượt thời lượng MP3 {audio_duration:.2f}s."
+                )
+            missing_indexes = sorted({
+                entry["scene"] for entry in entries if entry["scene"] not in videos
+            })
+            if missing_indexes:
+                preview = ", ".join(map(str, missing_indexes[:20]))
+                suffix = "..." if len(missing_indexes) > 20 else ""
+                raise ValueError(f"Không tìm thấy video cho scene: {preview}{suffix}")
+            resolved_entries = [dict(entry, video=str(videos[entry["scene"]])) for entry in entries]
+            destination_folder = Path(output_folder) if output_folder else audio_path.parent
+            _validate_output_folder(destination_folder)
+            output_path = destination_folder / f"{audio_path.stem}.mp4"
+            output_key = str(output_path.resolve()).casefold()
+            if output_key in seen_outputs:
+                raise ValueError(f"Nhiều MP3 sẽ ghi trùng output: {output_path.name}")
+            seen_outputs.add(output_key)
+            if output_path.exists():
+                skipped.append({
+                    "timeline": timeline_path.name,
+                    "mp3": audio_path.name,
+                    "elapsed": 0.0,
+                    "status": "BỎ QUA",
+                    "result": str(output_path),
+                    "detail": f"Đã có {output_path.name}",
+                })
+                continue
+            jobs.append(TimelineVideoJob(
+                timeline_path=timeline_path, audio_path=audio_path, output_path=output_path,
+                audio_duration=audio_duration, entries=resolved_entries, media_type="video",
+            ))
+        except (OSError, ValueError) as exc:
+            errors.append((timeline_path.name, str(exc)))
+    return jobs, skipped, errors
+
+
 def _random_zoom_motion(image_path, zoom):
     minimum, maximum, difference = zoom
     start = random.uniform(minimum, maximum)
@@ -919,6 +1630,10 @@ def _random_zoom_motion(image_path, zoom):
 
 def render_timeline_video(job, quality, fps, zoom, progress=None, cancelled=None, smooth_zoom=False,
                           motions=None):
+    if job.media_type == "video":
+        return render_timeline_clip_video(
+            job, quality, fps, progress=progress, cancelled=cancelled
+        )
     width, height = QUALITIES[validate_quality(quality)]
     fps = validate_fps(fps)
     zoom = parse_zoom_settings(*map(str, zoom))
@@ -1011,6 +1726,104 @@ def render_timeline_video(job, quality, fps, zoom, progress=None, cancelled=None
         )
         if result.returncode:
             raise RuntimeError("FFmpeg không thể ghép MP3: " + result.stdout.decode("utf-8", errors="replace")[-600:])
+        os.replace(pending, job.output_path)
+        return job.output_path, " + ".join(sorted(actual_encoders)) or encoder_label
+    finally:
+        if pending.exists():
+            pending.unlink()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _video_segment_command(ffmpeg, input_path, output_path, width, height, frames, fps,
+                           encoder_arguments, filter_threads):
+    """Build a deterministic no-motion command that loops, scales and trims one clip."""
+    video_filter = (
+        f"scale={width}:{height}:force_original_aspect_ratio=increase:flags=lanczos,"
+        f"crop={width}:{height},setsar=1,fps={fps}"
+    )
+    return [
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-stream_loop", "-1",
+        "-i", str(input_path), "-map", "0:v:0", "-an", "-vf", video_filter,
+        "-frames:v", str(frames), *encoder_arguments,
+        "-threads", str(filter_threads), "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        str(output_path),
+    ]
+
+
+def render_timeline_clip_video(job, quality, fps, progress=None, cancelled=None):
+    """Render numbered source clips on the JSON timeline without image motion effects."""
+    width, height = QUALITIES[validate_quality(quality)]
+    fps = validate_fps(fps)
+    ffmpeg = shutil.which("ffmpeg") or r"E:\SETUP\ffmpeg-2026-03-18-git-106616f13d-full_build\bin\ffmpeg.exe"
+    if not Path(ffmpeg).is_file():
+        raise RuntimeError("Không tìm thấy FFmpeg. Hãy thêm ffmpeg vào PATH.")
+    job.output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(tempfile.mkdtemp(prefix=".timeline_clips_", dir=job.output_path.parent))
+    pending = job.output_path.parent / f".{job.output_path.stem}.{uuid.uuid4().hex}.tmp"
+    silent_video = temp_dir / "silent.mp4"
+    encoder_arguments, encoder_label, _ = _render_profile(str(ffmpeg))
+    filter_threads = _filter_thread_budget(1)
+    cpu_arguments = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "19"]
+    actual_encoders = set()
+    total_frames = max(1, round(job.audio_duration * fps))
+    spans = []
+    for index, entry in enumerate(job.entries):
+        start_frame = 0 if index == 0 else round(entry["start"] * fps)
+        end_frame = (
+            round(job.entries[index + 1]["start"] * fps)
+            if index + 1 < len(job.entries) else total_frames
+        )
+        spans.append((entry["video"], max(1, end_frame - start_frame)))
+
+    try:
+        segments = []
+        for index, (video_path, frames) in enumerate(spans, 1):
+            if cancelled and cancelled():
+                raise InterruptedError("Đã dừng theo yêu cầu.")
+            segment = temp_dir / f"segment_{index:05d}.mp4"
+            attempts = [(encoder_arguments, encoder_label)]
+            if encoder_label != "CPU x264 (Veryfast)":
+                attempts.append((cpu_arguments, "CPU x264 fallback"))
+            error_text = ""
+            for arguments, label in attempts:
+                result = _run_ffmpeg(_video_segment_command(
+                    str(ffmpeg), video_path, segment, width, height, frames, fps,
+                    arguments, filter_threads,
+                ))
+                if result.returncode == 0:
+                    actual_encoders.add(label)
+                    segments.append(segment)
+                    break
+                error_text += result.stdout.decode("utf-8", errors="replace")
+            else:
+                raise RuntimeError(f"FFmpeg lỗi khi xử lý video scene #{index}: {error_text[-600:]}")
+            if progress:
+                progress(index, len(spans))
+
+        concat_file = temp_dir / "concat.txt"
+        with open(concat_file, "w", encoding="utf-8") as handle:
+            for segment in segments:
+                handle.write("file '" + str(segment).replace("'", "'\\''") + "'\n")
+        result = _run_ffmpeg([
+            str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y", "-f", "concat",
+            "-safe", "0", "-i", str(concat_file), "-c", "copy", str(silent_video),
+        ])
+        if result.returncode:
+            raise RuntimeError(
+                "FFmpeg không thể ghép các đoạn video: "
+                + result.stdout.decode("utf-8", errors="replace")[-600:]
+            )
+        result = _run_ffmpeg([
+            str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y", "-i", str(silent_video),
+            "-i", str(job.audio_path), "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart",
+            "-f", "mp4", str(pending),
+        ])
+        if result.returncode:
+            raise RuntimeError(
+                "FFmpeg không thể ghép MP3: "
+                + result.stdout.decode("utf-8", errors="replace")[-600:]
+            )
         os.replace(pending, job.output_path)
         return job.output_path, " + ".join(sorted(actual_encoders)) or encoder_label
     finally:

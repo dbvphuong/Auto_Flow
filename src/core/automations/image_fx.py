@@ -3,6 +3,7 @@ import time
 import logging
 import re
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from common.diagnostics import save_page_diagnostics
 from .flow_ui import (
     click_generate, configure_generation, dismiss_dashboard_promos,
     enter_flow_app, find_prompt_input, generation_is_busy, open_new_project,
@@ -844,13 +845,7 @@ def _run_image_fx_once(context, account, prompt, task_id, config):
             if "accounts.google.com" in page.url or "signin" in page.url:
                 page.close()
                 raise Exception("Tài khoản đã bị đăng xuất (Signed out) trên Google. Vui lòng đăng nhập lại tài khoản này trên giao diện Tool.")
-            err_img_path = os.path.join(save_path, f"error_{final_name}_fail.png")
-            err_html_path = os.path.join(save_path, f"error_{final_name}_fail.html")
-            page.screenshot(path=err_img_path)
-            logging.warning(f"[Flow] Đã chụp ảnh màn hình lỗi tạo ảnh tại: {err_img_path}")
-            with open(err_html_path, "w", encoding="utf-8") as f:
-                f.write(page.content())
-            # Giữ lại file error để người dùng kiểm tra lỗi
+            save_page_diagnostics(page, "flow_image_fail", final_name)
         except Exception as se:
             if "Tài khoản đã bị đăng xuất" in str(se):
                 raise
@@ -862,13 +857,7 @@ def _run_image_fx_once(context, account, prompt, task_id, config):
             if "accounts.google.com" in page.url or "signin" in page.url:
                 page.close()
                 raise Exception("Tài khoản đã bị đăng xuất (Signed out) trên Google. Vui lòng đăng nhập lại tài khoản này trên giao diện Tool.")
-            err_img_path = os.path.join(save_path, f"error_{final_name}_err.png")
-            err_html_path = os.path.join(save_path, f"error_{final_name}_err.html")
-            page.screenshot(path=err_img_path)
-            logging.warning(f"[Flow] Đã chụp ảnh màn hình lỗi hệ thống tại: {err_img_path}")
-            with open(err_html_path, "w", encoding="utf-8") as f:
-                f.write(page.content())
-            # Giữ lại file error để người dùng kiểm tra lỗi
+            save_page_diagnostics(page, "flow_image_error", final_name)
         except Exception as se:
             if "Tài khoản đã bị đăng xuất" in str(se):
                 raise

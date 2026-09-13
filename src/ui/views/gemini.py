@@ -10,13 +10,163 @@ from PyQt6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QGridLayout, QGroupBox, QLabel,
     QLineEdit, QTextEdit, QPushButton, QSpinBox, QComboBox, QFileDialog, QSplitter,
     QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QMessageBox,
-    QDialog, QPlainTextEdit, QApplication,
+    QDialog, QPlainTextEdit, QApplication, QListWidget, QDialogButtonBox,
+    QInputDialog,
 )
 
 from core.workers import GeminiWorker, GEMINI_MAX_RETRIES
 from common.gemini_languages import COUNTRIES, GEMINI_COUNTRY_OPTIONS, LANGUAGE_BY_COUNTRY
+from common.logger import activity, progress as log_progress, warning as log_warning
+from common.text_splitter import combine_single_line_chunks, split_text_into_single_line_chunks
 from data.database import SessionLocal
 from data.models import Account, GeminiBatch
+
+
+class MasterPromptSettingsDialog(QDialog):
+    """Create and maintain the Master Prompt templates used by GeminiView."""
+
+    def __init__(self, parent, templates, selected_name=""):
+        super().__init__(parent)
+        self.templates = dict(templates)
+        self.selected_name = selected_name
+        self.setWindowTitle("Cài đặt Master Prompt")
+        self.resize(760, 480)
+
+        layout = QHBoxLayout(self)
+        left_layout = QVBoxLayout()
+        self.list_templates = QListWidget()
+        left_layout.addWidget(QLabel("Danh sách template"))
+        left_layout.addWidget(self.list_templates, 1)
+
+        self.btn_new = QPushButton("＋ Tạo mới")
+        self.btn_import = QPushButton("📄 Nạp file TXT")
+        self.btn_rename = QPushButton("Đổi tên")
+        self.btn_delete = QPushButton("Xóa")
+        for button in (self.btn_new, self.btn_import, self.btn_rename, self.btn_delete):
+            left_layout.addWidget(button)
+        layout.addLayout(left_layout, 1)
+
+        right_layout = QVBoxLayout()
+        right_layout.addWidget(QLabel("Nội dung Master Prompt"))
+        self.text_prompt = QPlainTextEdit()
+        self.text_prompt.setPlaceholderText(
+            "Điền trực tiếp Master Prompt tại đây hoặc dùng nút Nạp file TXT."
+        )
+        right_layout.addWidget(self.text_prompt, 1)
+        self.btn_save = QPushButton("💾 Lưu nội dung")
+        right_layout.addWidget(self.btn_save)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.accept)
+        right_layout.addWidget(buttons)
+        layout.addLayout(right_layout, 3)
+
+        self.list_templates.currentTextChanged.connect(self._load_current)
+        self.btn_new.clicked.connect(self._create_template)
+        self.btn_import.clicked.connect(self._import_template)
+        self.btn_save.clicked.connect(self._save_current)
+        self.btn_rename.clicked.connect(self._rename_current)
+        self.btn_delete.clicked.connect(self._delete_current)
+        self._refresh_list(selected_name)
+
+    def _refresh_list(self, selected_name=""):
+        self.list_templates.blockSignals(True)
+        self.list_templates.clear()
+        self.list_templates.addItems(self.templates.keys())
+        matches = self.list_templates.findItems(
+            selected_name, Qt.MatchFlag.MatchExactly
+        )
+        if matches:
+            self.list_templates.setCurrentItem(matches[0])
+        elif self.list_templates.count():
+            self.list_templates.setCurrentRow(0)
+        self.list_templates.blockSignals(False)
+        self._load_current(self.list_templates.currentItem().text() if self.list_templates.currentItem() else "")
+
+    def _ask_unique_name(self, title, initial=""):
+        name, accepted = QInputDialog.getText(self, title, "Tên template:", text=initial)
+        name = name.strip()
+        if not accepted or not name:
+            return ""
+        duplicate = next(
+            (item for item in self.templates if item.casefold() == name.casefold() and item != initial),
+            None,
+        )
+        if duplicate:
+            QMessageBox.warning(self, "Trùng tên", f"Template “{duplicate}” đã tồn tại.")
+            return ""
+        return name
+
+    def _load_current(self, name):
+        self.selected_name = name
+        self.text_prompt.setPlainText(self.templates.get(name, ""))
+        enabled = bool(name)
+        self.btn_save.setEnabled(enabled)
+        self.btn_rename.setEnabled(enabled)
+        self.btn_delete.setEnabled(enabled)
+
+    def _create_template(self):
+        name = self._ask_unique_name("Tạo Master Prompt mới")
+        if not name:
+            return
+        self.templates[name] = ""
+        self._refresh_list(name)
+        self.text_prompt.setFocus()
+
+    def _import_template(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Nạp Master Prompt", "", "Text Files (*.txt *.md);;All Files (*)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8-sig") as source_file:
+                content = source_file.read()
+        except (OSError, UnicodeError) as exc:
+            QMessageBox.critical(self, "Không đọc được file", str(exc))
+            return
+        default_name = os.path.splitext(os.path.basename(path))[0]
+        name = self._ask_unique_name("Tên Master Prompt", default_name)
+        if not name:
+            return
+        self.templates[name] = content
+        self._refresh_list(name)
+
+    def _save_current(self):
+        name = self.list_templates.currentItem().text() if self.list_templates.currentItem() else ""
+        if not name:
+            return
+        content = self.text_prompt.toPlainText().strip()
+        if not content:
+            QMessageBox.warning(self, "Nội dung trống", "Master Prompt không được để trống.")
+            return
+        self.templates[name] = content
+        self.selected_name = name
+
+    def _rename_current(self):
+        old_name = self.list_templates.currentItem().text() if self.list_templates.currentItem() else ""
+        if not old_name:
+            return
+        new_name = self._ask_unique_name("Đổi tên Master Prompt", old_name)
+        if not new_name or new_name == old_name:
+            return
+        items = list(self.templates.items())
+        self.templates = {
+            (new_name if name == old_name else name): value for name, value in items
+        }
+        self._refresh_list(new_name)
+
+    def _delete_current(self):
+        name = self.list_templates.currentItem().text() if self.list_templates.currentItem() else ""
+        if not name:
+            return
+        answer = QMessageBox.question(
+            self, "Xóa Master Prompt", f"Xóa template “{name}”?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        del self.templates[name]
+        self._refresh_list()
 
 
 class GeminiView(QWidget):
@@ -38,6 +188,11 @@ class GeminiView(QWidget):
         self.retry_last_account_ids = {}
         self.no_pro_accounts_notified = False
         self.country_checks = {}
+        self.master_templates = {}
+        self.country_templates = {}
+        self._custom_country_selection = []
+        self._active_country_template = None
+        self._changing_country_template = False
         self._build_ui()
         self._connect_signals()
         self.queue_timer = QTimer(self)
@@ -66,13 +221,12 @@ class GeminiView(QWidget):
 
         content_group = QGroupBox("Nội dung đầu vào")
         content_layout = QGridLayout(content_group)
-        self.line_master_file = QLineEdit()
-        self.line_master_file.setReadOnly(True)
-        self.line_master_file.setPlaceholderText("Nhập text bên dưới hoặc chọn một file")
-        self.btn_master_file = QPushButton("📄 Chọn file")
-        self.text_master_prompt = QTextEdit()
-        self.text_master_prompt.setPlaceholderText("Nhập Master Prompt...")
-        self.text_master_prompt.setMaximumHeight(130)
+        self.combo_master_template = QComboBox()
+        self.combo_master_template.setPlaceholderText("Chọn Master Prompt...")
+        self.btn_master_settings = QPushButton("⚙ Cài đặt")
+        self.btn_master_settings.setToolTip(
+            "Nạp, tạo, chỉnh sửa, đổi tên hoặc xóa Master Prompt"
+        )
 
         self.line_story_file = QLineEdit()
         self.line_story_file.setReadOnly(True)
@@ -83,25 +237,34 @@ class GeminiView(QWidget):
         self.text_story.setMaximumHeight(160)
 
         content_layout.addWidget(QLabel("Master Prompt:"), 0, 0)
-        content_layout.addWidget(self.line_master_file, 0, 1)
-        content_layout.addWidget(self.btn_master_file, 0, 2)
-        content_layout.addWidget(self.text_master_prompt, 1, 0, 1, 3)
-        content_layout.addWidget(QLabel("Cốt truyện:"), 2, 0)
-        content_layout.addWidget(self.line_story_file, 2, 1)
-        content_layout.addWidget(self.btn_story_file, 2, 2)
-        content_layout.addWidget(self.text_story, 3, 0, 1, 3)
+        content_layout.addWidget(self.combo_master_template, 0, 1)
+        content_layout.addWidget(self.btn_master_settings, 0, 2)
+        content_layout.addWidget(QLabel("Cốt truyện:"), 1, 0)
+        content_layout.addWidget(self.line_story_file, 1, 1)
+        content_layout.addWidget(self.btn_story_file, 1, 2)
+        content_layout.addWidget(self.text_story, 2, 0, 1, 3)
         left_layout.addWidget(content_group)
 
         country_group = QGroupBox("Quốc gia — tích bao nhiêu sẽ tạo bấy nhiêu batch")
         country_layout = QGridLayout(country_group)
+        self.combo_country_template = QComboBox()
+        self.combo_country_template.addItem("Tùy chọn", None)
+        self.btn_save_country_template = QPushButton("💾 Lưu cấu hình")
+        self.btn_rename_country_template = QPushButton("Đổi tên")
+        self.btn_delete_country_template = QPushButton("Xóa")
+        country_layout.addWidget(QLabel("Cấu hình:"), 0, 0)
+        country_layout.addWidget(self.combo_country_template, 0, 1, 1, 2)
+        country_layout.addWidget(self.btn_save_country_template, 1, 0)
+        country_layout.addWidget(self.btn_rename_country_template, 1, 1)
+        country_layout.addWidget(self.btn_delete_country_template, 1, 2)
         self.chk_all_countries = QCheckBox("Chọn tất cả")
         self.chk_all_countries.setStyleSheet("font-weight:bold;color:#c4b5fd;")
-        country_layout.addWidget(self.chk_all_countries, 0, 0, 1, 3)
+        country_layout.addWidget(self.chk_all_countries, 2, 0, 1, 3)
         for index, (country, display_name) in enumerate(GEMINI_COUNTRY_OPTIONS):
             checkbox = QCheckBox(display_name)
             checkbox.setToolTip(f"File đầu ra: {display_name}.txt")
             self.country_checks[country] = checkbox
-            country_layout.addWidget(checkbox, index // 3 + 1, index % 3)
+            country_layout.addWidget(checkbox, index // 3 + 3, index % 3)
         left_layout.addWidget(country_group)
 
         run_group = QGroupBox("Điều kiện chạy")
@@ -159,6 +322,42 @@ class GeminiView(QWidget):
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         right_layout.addWidget(self.table_queue, 1)
+
+        multi_split_controls = QHBoxLayout()
+        self.btn_split_many_files = QPushButton("✂ TÁCH NHIỀU FILE TXT CON")
+        self.btn_split_many_files.setStyleSheet(self._button_style("#b45309", "#d97706"))
+        self.btn_split_many_files.setToolTip(
+            "Tách một file TXT thành folder full chứa 1.txt, 2.txt, ...\n"
+            "Mỗi dòng nguồn tạo ít nhất một file; mỗi file con chỉ có một dòng.\n"
+            "Dòng quá dài sẽ ưu tiên tách ở cuối câu, sau đó đến dấu câu."
+        )
+        self.spin_many_min_words = QSpinBox()
+        self.spin_many_min_words.setRange(1, 1000)
+        self.spin_many_min_words.setValue(6)
+        self.spin_many_max_words = QSpinBox()
+        self.spin_many_max_words.setRange(1, 1000)
+        self.spin_many_max_words.setValue(25)
+        self.combo_many_source_mode = QComboBox()
+        self.combo_many_source_mode.addItem("Giữ nguyên file gốc", "keep")
+        self.combo_many_source_mode.addItem("Ghi đè file gốc", "overwrite")
+        self.combo_many_source_mode.setToolTip(
+            "Giữ nguyên: không thay đổi file đã chọn.\n"
+            "Ghi đè: gộp nội dung các file con vào file gốc, mỗi file con là một dòng."
+        )
+        self.line_many_split_file = QLineEdit()
+        self.line_many_split_file.setReadOnly(True)
+        self.line_many_split_file.setPlaceholderText("Chọn một file .txt cần tách...")
+        self.btn_many_split_file = QPushButton("📄 Chọn file")
+        multi_split_controls.addWidget(self.btn_split_many_files)
+        multi_split_controls.addWidget(QLabel("Từ tối thiểu:"))
+        multi_split_controls.addWidget(self.spin_many_min_words)
+        multi_split_controls.addWidget(QLabel("Từ tối đa:"))
+        multi_split_controls.addWidget(self.spin_many_max_words)
+        multi_split_controls.addWidget(QLabel("File gốc:"))
+        multi_split_controls.addWidget(self.combo_many_source_mode)
+        multi_split_controls.addWidget(self.line_many_split_file, 1)
+        multi_split_controls.addWidget(self.btn_many_split_file)
+        right_layout.addLayout(multi_split_controls)
 
         split_controls = QHBoxLayout()
         self.btn_split_lines = QPushButton("↵ CHIA DÒNG")
@@ -259,17 +458,22 @@ class GeminiView(QWidget):
         )
 
     def _connect_signals(self):
-        self.btn_master_file.clicked.connect(
-            lambda: self._choose_text_file(self.line_master_file, self.text_master_prompt)
-        )
+        self.btn_master_settings.clicked.connect(self._open_master_prompt_settings)
+        self.combo_master_template.currentIndexChanged.connect(self.save_config)
         self.btn_story_file.clicked.connect(
             lambda: self._choose_text_file(self.line_story_file, self.text_story)
         )
+        self.combo_country_template.currentIndexChanged.connect(self._country_template_changed)
+        self.btn_save_country_template.clicked.connect(self._save_country_template)
+        self.btn_rename_country_template.clicked.connect(self._rename_country_template)
+        self.btn_delete_country_template.clicked.connect(self._delete_country_template)
         self.btn_output_dir.clicked.connect(self._browse_output_folder)
         self.chk_all_countries.toggled.connect(self._toggle_all_countries)
         self.chk_all_batches.toggled.connect(self._toggle_all_batches)
         self.btn_create_queue.clicked.connect(self.create_country_batches)
         self.btn_delete.clicked.connect(self.delete_selected)
+        self.btn_split_many_files.clicked.connect(self.run_many_file_splitting)
+        self.btn_many_split_file.clicked.connect(self._choose_many_split_file)
         self.btn_split_lines.clicked.connect(self.run_line_splitting)
         self.btn_split_file.clicked.connect(self._choose_split_file)
         self.btn_split_folder.clicked.connect(self._choose_split_folder)
@@ -283,17 +487,147 @@ class GeminiView(QWidget):
         self.btn_retry.clicked.connect(self.retry_failed)
         self.table_queue.cellDoubleClicked.connect(self._open_result)
         for widget_signal in (
-            self.text_master_prompt.textChanged, self.text_story.textChanged,
+            self.text_story.textChanged,
             self.line_output_dir.textChanged, self.line_done_marker.textChanged,
             self.spin_threads.valueChanged, self.spin_max_continuations.valueChanged,
             self.line_smooth_folder.textChanged, self.spin_smooth_min_words.valueChanged,
             self.line_split_path.textChanged, self.spin_split_min_words.valueChanged,
             self.spin_split_max_words.valueChanged,
             self.combo_split_output_mode.currentIndexChanged,
+            self.line_many_split_file.textChanged, self.spin_many_min_words.valueChanged,
+            self.spin_many_max_words.valueChanged,
+            self.combo_many_source_mode.currentIndexChanged,
         ):
             widget_signal.connect(self.save_config)
         for checkbox in self.country_checks.values():
             checkbox.toggled.connect(self.save_config)
+
+    def _open_master_prompt_settings(self):
+        selected_name = self.combo_master_template.currentData() or ""
+        dialog = MasterPromptSettingsDialog(self, self.master_templates, selected_name)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.master_templates = dialog.templates
+        self._refresh_master_templates(dialog.selected_name)
+        self.save_config()
+
+    def _refresh_master_templates(self, selected_name=""):
+        self.combo_master_template.blockSignals(True)
+        self.combo_master_template.clear()
+        for name in self.master_templates:
+            self.combo_master_template.addItem(name, name)
+        selected_index = self.combo_master_template.findData(selected_name)
+        if selected_index < 0 and self.combo_master_template.count():
+            selected_index = 0
+        self.combo_master_template.setCurrentIndex(selected_index)
+        self.combo_master_template.blockSignals(False)
+
+    def _current_master_prompt(self):
+        return self.master_templates.get(self.combo_master_template.currentData(), "")
+
+    def _apply_country_selection(self, countries):
+        selected_countries = set(countries)
+        for country, checkbox in self.country_checks.items():
+            checkbox.blockSignals(True)
+            checkbox.setChecked(country in selected_countries)
+            checkbox.blockSignals(False)
+        self.chk_all_countries.blockSignals(True)
+        self.chk_all_countries.setChecked(
+            bool(self.country_checks) and len(selected_countries) == len(self.country_checks)
+        )
+        self.chk_all_countries.blockSignals(False)
+
+    def _refresh_country_templates(self, selected_name=None):
+        self.combo_country_template.blockSignals(True)
+        self.combo_country_template.clear()
+        self.combo_country_template.addItem("Tùy chọn", None)
+        for name in self.country_templates:
+            self.combo_country_template.addItem(name, name)
+        selected_index = self.combo_country_template.findData(selected_name)
+        self.combo_country_template.setCurrentIndex(max(0, selected_index))
+        self.combo_country_template.blockSignals(False)
+        self._active_country_template = selected_name if selected_index > 0 else None
+        self._update_country_template_buttons()
+
+    def _country_template_changed(self):
+        if self._changing_country_template:
+            return
+        if self._active_country_template is None:
+            self._custom_country_selection = self._selected_countries()
+        selected_name = self.combo_country_template.currentData()
+        self._active_country_template = selected_name
+        countries = (
+            self.country_templates.get(selected_name, [])
+            if selected_name is not None else self._custom_country_selection
+        )
+        self._changing_country_template = True
+        try:
+            self._apply_country_selection(countries)
+        finally:
+            self._changing_country_template = False
+        self._update_country_template_buttons()
+        self.save_config()
+
+    def _update_country_template_buttons(self):
+        is_template = self.combo_country_template.currentData() is not None
+        self.btn_rename_country_template.setEnabled(is_template)
+        self.btn_delete_country_template.setEnabled(is_template)
+        self.btn_save_country_template.setText(
+            "💾 Cập nhật cấu hình" if is_template else "💾 Lưu cấu hình"
+        )
+
+    def _unique_country_template_name(self, title, initial=""):
+        name, accepted = QInputDialog.getText(self, title, "Tên template:", text=initial)
+        name = name.strip()
+        if not accepted or not name:
+            return ""
+        duplicate = next(
+            (item for item in self.country_templates if item.casefold() == name.casefold() and item != initial),
+            None,
+        )
+        if duplicate:
+            QMessageBox.warning(self, "Trùng tên", f"Template “{duplicate}” đã tồn tại.")
+            return ""
+        return name
+
+    def _save_country_template(self):
+        selected_name = self.combo_country_template.currentData()
+        if selected_name is None:
+            selected_name = self._unique_country_template_name("Lưu cấu hình quốc gia")
+            if not selected_name:
+                return
+        self.country_templates[selected_name] = self._selected_countries()
+        self._refresh_country_templates(selected_name)
+        self.save_config()
+
+    def _rename_country_template(self):
+        old_name = self.combo_country_template.currentData()
+        if old_name is None:
+            return
+        new_name = self._unique_country_template_name("Đổi tên cấu hình quốc gia", old_name)
+        if not new_name or new_name == old_name:
+            return
+        items = list(self.country_templates.items())
+        self.country_templates = {
+            (new_name if name == old_name else name): value for name, value in items
+        }
+        self._refresh_country_templates(new_name)
+        self.save_config()
+
+    def _delete_country_template(self):
+        name = self.combo_country_template.currentData()
+        if name is None:
+            return
+        answer = QMessageBox.question(
+            self, "Xóa cấu hình quốc gia", f"Xóa template “{name}”?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        del self.country_templates[name]
+        self._refresh_country_templates(None)
+        self._apply_country_selection(self._custom_country_selection)
+        self.save_config()
 
     def _choose_text_file(self, path_line, text_edit):
         path, _ = QFileDialog.getOpenFileName(
@@ -342,6 +676,101 @@ class GeminiView(QWidget):
         )
         if folder:
             self.line_split_path.setText(os.path.abspath(folder))
+
+    def _choose_many_split_file(self):
+        start_path = self.line_many_split_file.text().strip()
+        if not os.path.isdir(start_path):
+            start_path = os.path.dirname(start_path) if start_path else ""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Chọn file text cần tách thành nhiều file", start_path, "Text Files (*.txt)"
+        )
+        if path:
+            self.line_many_split_file.setText(os.path.abspath(path))
+
+    def run_many_file_splitting(self):
+        source_path = self.line_many_split_file.text().strip()
+        minimum_words = self.spin_many_min_words.value()
+        maximum_words = self.spin_many_max_words.value()
+        source_mode = self.combo_many_source_mode.currentData() or "keep"
+        if minimum_words > maximum_words:
+            QMessageBox.warning(
+                self, "Giới hạn không hợp lệ",
+                "Số từ tối thiểu không được lớn hơn số từ tối đa.",
+            )
+            return
+        if not os.path.isfile(source_path) or not source_path.lower().endswith(".txt"):
+            QMessageBox.warning(self, "File không hợp lệ", "Hãy chọn một file .txt đầu vào.")
+            return
+
+        source_path = os.path.abspath(source_path)
+        output_dir = os.path.join(os.path.dirname(source_path), "full")
+        try:
+            with open(source_path, "r", encoding="utf-8-sig", newline="") as source_file:
+                raw_text = source_file.read()
+            chunks = split_text_into_single_line_chunks(
+                raw_text, minimum_words, maximum_words
+            )
+            if not chunks:
+                QMessageBox.warning(self, "File trống", "File đầu vào không có nội dung để tách.")
+                return
+
+            os.makedirs(output_dir, exist_ok=True)
+            for index, chunk in enumerate(chunks, start=1):
+                target_path = os.path.join(output_dir, f"{index}.txt")
+                temp_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        mode="w", encoding="utf-8-sig", newline="", delete=False,
+                        dir=output_dir, prefix=f".{index}.", suffix=".tmp",
+                    ) as target_file:
+                        temp_path = target_file.name
+                        target_file.write(chunk)
+                    os.replace(temp_path, target_path)
+                    temp_path = None
+                finally:
+                    if temp_path and os.path.exists(temp_path):
+                        os.remove(temp_path)
+
+            numbered_file_pattern = re.compile(r"^(\d+)\.txt$", flags=re.IGNORECASE)
+            for entry in os.scandir(output_dir):
+                match = numbered_file_pattern.match(entry.name)
+                if entry.is_file() and match and int(match.group(1)) > len(chunks):
+                    os.remove(entry.path)
+
+            if source_mode == "overwrite":
+                combined_text = combine_single_line_chunks(chunks)
+                temp_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        mode="w", encoding="utf-8-sig", newline="", delete=False,
+                        dir=os.path.dirname(source_path), prefix=".gemini_source.", suffix=".tmp",
+                    ) as source_file:
+                        temp_path = source_file.name
+                        source_file.write(combined_text)
+                    os.replace(temp_path, source_path)
+                    temp_path = None
+                finally:
+                    if temp_path and os.path.exists(temp_path):
+                        os.remove(temp_path)
+
+            output_word_counts = [self._count_words(chunk) for chunk in chunks]
+            source_result = (
+                f"Đã ghi đè file gốc thành {len(chunks):,} dòng."
+                if source_mode == "overwrite"
+                else "File gốc được giữ nguyên."
+            )
+            QMessageBox.information(
+                self, "Tách file thành công",
+                f"Đã tạo {len(chunks):,} file TXT trong:\n{output_dir}\n\n"
+                f"Giới hạn: {minimum_words:,}–{maximum_words:,} từ/file\n"
+                f"Tổng số từ: {sum(output_word_counts):,}\n"
+                "Mỗi file con chứa đúng một dòng nội dung.\n"
+                f"{source_result}",
+            )
+            QDesktopServices.openUrl(QUrl.fromLocalFile(output_dir))
+        except (OSError, UnicodeError, ValueError) as exc:
+            logging.exception("[Gemini Tách File Con] Lỗi xử lý %s", source_path)
+            QMessageBox.critical(self, "Không tách được file", str(exc))
 
     @classmethod
     def _split_line_by_word_limits(cls, line, minimum_words, maximum_words):
@@ -758,13 +1187,16 @@ class GeminiView(QWidget):
         return [name for name, checkbox in self.country_checks.items() if checkbox.isChecked()]
 
     def _validate_inputs(self):
-        master_prompt = self.text_master_prompt.toPlainText().strip()
+        master_prompt = self._current_master_prompt().strip()
         story = self.text_story.toPlainText().strip()
         output_dir = self.line_output_dir.text().strip()
         done_marker = self.line_done_marker.text().strip()
         countries = self._selected_countries()
         if not master_prompt:
-            QMessageBox.warning(self, "Thiếu Master Prompt", "Hãy nhập text hoặc chọn file Master Prompt.")
+            QMessageBox.warning(
+                self, "Thiếu Master Prompt",
+                "Hãy chọn một template Master Prompt có nội dung. Dùng nút Cài đặt để tạo template mới.",
+            )
             return None
         if not story:
             QMessageBox.warning(self, "Thiếu cốt truyện", "Hãy nhập text hoặc chọn file cốt truyện.")
@@ -882,6 +1314,15 @@ class GeminiView(QWidget):
             status_item.setForeground(QColor(self.STATUS_COLORS.get(batch.status, "#e5e7eb")))
             status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.table_queue.setItem(row, 4, status_item)
+            status_combo = QComboBox()
+            for status in ("PENDING", "SUCCESS", "FAILED"):
+                status_combo.addItem(status, status)
+            self._set_status_combo(status_combo, batch.status)
+            status_combo.currentIndexChanged.connect(
+                lambda _index, batch_id=batch.id, combo=status_combo:
+                self._manual_status_changed(batch_id, combo)
+            )
+            self.table_queue.setCellWidget(row, 4, status_combo)
             if batch.status == "SUCCESS":
                 detail = batch.result_path
             elif batch.status == "PENDING" and (batch.retry_count or 0) > 0:
@@ -896,6 +1337,69 @@ class GeminiView(QWidget):
             self.table_queue.setItem(row, 5, detail_item)
         self._sync_all_batches_checkbox()
         self._update_stats()
+
+    def _set_status_combo(self, combo, status):
+        combo.blockSignals(True)
+        running_index = combo.findData("RUNNING")
+        if status == "RUNNING" and running_index < 0:
+            combo.insertItem(1, "RUNNING", "RUNNING")
+        elif status != "RUNNING" and running_index >= 0:
+            combo.removeItem(running_index)
+        status_index = combo.findData(status)
+        combo.setCurrentIndex(max(0, status_index))
+        combo.setEnabled(status != "RUNNING")
+        combo.setToolTip(
+            "Không thể sửa khi batch đang chạy."
+            if status == "RUNNING" else "Chọn trạng thái mới cho batch."
+        )
+        color = self.STATUS_COLORS.get(status, "#e5e7eb")
+        combo.setStyleSheet(
+            f"QComboBox{{color:{color};font-weight:bold;padding:2px 6px;}}"
+            "QComboBox:disabled{color:#60a5fa;}"
+        )
+        combo.blockSignals(False)
+
+    def _manual_status_changed(self, batch_id, combo):
+        new_status = combo.currentData()
+        if new_status not in ("PENDING", "SUCCESS", "FAILED"):
+            return
+        db = SessionLocal()
+        try:
+            batch = db.query(GeminiBatch).filter(GeminiBatch.id == batch_id).first()
+            if not batch:
+                QTimer.singleShot(0, self.load_batches)
+                return
+            if batch.status == "RUNNING":
+                logging.warning(
+                    "[Gemini UI] Không đổi trạng thái thủ công cho batch id=%s đang RUNNING",
+                    batch_id,
+                )
+                QTimer.singleShot(0, self.load_batches)
+                return
+            old_status = batch.status
+            batch.status = new_status
+            batch.account_id = None
+            if new_status == "PENDING":
+                batch.current_part = 0
+                batch.retry_count = 0
+                batch.result_path = None
+                batch.error_message = None
+            elif new_status == "SUCCESS":
+                batch.retry_count = 0
+                batch.error_message = None
+            else:
+                batch.result_path = None
+                batch.error_message = batch.error_message or "Đã chuyển sang FAILED thủ công"
+            db.commit()
+            self.task_queue = [item for item in self.task_queue if item != batch_id]
+            self.retry_last_account_ids.pop(batch_id, None)
+            logging.info(
+                "[Gemini UI] Đổi trạng thái thủ công batch id=%s: %s -> %s",
+                batch_id, old_status, new_status,
+            )
+        finally:
+            db.close()
+        self.load_batches()
 
     def _selected_batch_ids(self):
         selected = []
@@ -962,6 +1466,8 @@ class GeminiView(QWidget):
         queued = set(self.task_queue)
         running = {worker.batch_id for worker in self.workers if worker.isRunning()}
         self.task_queue.extend(batch.id for batch in batches if batch.id not in queued | running)
+        self.log_run_total = len(self.task_queue) + len(running)
+        self.log_run_done = 0
         self.window_slot_count = max(
             1, min(self.spin_threads.value(), len(accounts), len(self.task_queue) + len(running))
         )
@@ -974,6 +1480,7 @@ class GeminiView(QWidget):
             self.spin_threads.value(), min(self.spin_threads.value(), len(accounts)),
         )
         self.is_paused = False
+        activity("[Gemini] Bắt đầu xử lý 0/%s batch", self.log_run_total)
         self.account_cursor = 0
         self.session_skipped_account_ids.clear()
         self.retry_last_account_ids = {
@@ -999,6 +1506,11 @@ class GeminiView(QWidget):
             return
         if not self.task_queue and not active_workers:
             logging.info("[Gemini UI] Queue đã hoàn tất; không còn worker hoạt động")
+            if getattr(self, "log_run_total", 0):
+                activity(
+                    "[Gemini] Đã kết thúc: %s/%s batch",
+                    self.log_run_done, self.log_run_total,
+                )
             self.queue_timer.stop()
             self.btn_run.setEnabled(True)
             self.btn_run_selected.setEnabled(True)
@@ -1113,6 +1625,7 @@ class GeminiView(QWidget):
 
     def pause_tasks(self):
         self.is_paused = not self.is_paused
+        activity("[Gemini] %s", "Đã tạm dừng" if self.is_paused else "Tiếp tục chạy")
         logging.info(
             "[Gemini UI] %s queue; workers_running=%s; queue_waiting=%s",
             "TẠM DỪNG" if self.is_paused else "TIẾP TỤC",
@@ -1126,6 +1639,8 @@ class GeminiView(QWidget):
             self.process_queue()
 
     def stop_tasks(self):
+        if self.task_queue or any(worker.isRunning() for worker in self.workers):
+            activity("[Gemini] Đang dừng toàn bộ tác vụ")
         logging.warning(
             "[Gemini UI] DỪNG queue; queue_waiting=%s; workers_running=%s",
             len(self.task_queue), sum(1 for worker in self.workers if worker.isRunning()),
@@ -1229,18 +1744,33 @@ class GeminiView(QWidget):
     def _on_status(self, batch_id, status):
         logging.info("[Gemini UI] Batch id=%s status signal=%s", batch_id, status)
         self._set_row(batch_id, status=status)
+        if status == "RUNNING":
+            log_progress(
+                "Gemini", getattr(self, "log_run_done", 0),
+                getattr(self, "log_run_total", 0), f"Đang chạy batch #{batch_id}",
+            )
 
     def _on_continuation(self, batch_id, current, total):
         logging.info("[Gemini UI] Batch id=%s progress signal=%s/%s", batch_id, current, total)
         self._set_row(batch_id, continuation=f"{current}/{total}")
+        log_progress("Gemini", current, total, f"Batch #{batch_id}")
 
     def _on_finished(self, batch_id, result_path):
         logging.info("[Gemini UI] Batch id=%s finished; result=%s", batch_id, result_path)
         self._set_row(batch_id, status="SUCCESS", detail=result_path)
+        self.log_run_done = getattr(self, "log_run_done", 0) + 1
+        log_progress(
+            "Gemini", self.log_run_done, getattr(self, "log_run_total", 0),
+            f"Hoàn thành batch #{batch_id}",
+        )
         QTimer.singleShot(0, self.process_queue)
 
     def _on_error(self, batch_id, message):
-        logging.error("[Gemini UI] Batch id=%s error=%s", batch_id, message)
+        self.log_run_done = getattr(self, "log_run_done", 0) + 1
+        logging.error(
+            "[Gemini] Batch #%s thất bại (%s/%s): %s",
+            batch_id, self.log_run_done, getattr(self, "log_run_total", 0), message,
+        )
         self._set_row(batch_id, status="FAILED", detail=message)
         QTimer.singleShot(0, self.process_queue)
 
@@ -1252,11 +1782,9 @@ class GeminiView(QWidget):
             f"Retry {retry_number}/{GEMINI_MAX_RETRIES}; "
             f"đã đưa về cuối queue sau lỗi: {message}"
         )
-        logging.warning(
-            "[Gemini UI] Retry batch id=%s lần %s/%s; "
-            "tránh account id=%s ở lượt kế; queue=%s",
-            batch_id, retry_number, GEMINI_MAX_RETRIES,
-            account_id, self.task_queue,
+        log_warning(
+            "[Gemini] Batch #%s lỗi, thử lại %s/%s: %s",
+            batch_id, retry_number, GEMINI_MAX_RETRIES, message,
         )
         self._set_row(batch_id, account="—", status="PENDING", detail=detail)
         QTimer.singleShot(0, self.process_queue)
@@ -1265,10 +1793,9 @@ class GeminiView(QWidget):
         self.session_skipped_account_ids.add(account_id)
         if batch_id not in self.task_queue:
             self.task_queue.append(batch_id)
-        logging.warning(
-            "[Gemini UI] Bỏ qua account id=%s trong phiên hiện tại; "
-            "đưa batch id=%s về cuối queue; lý do=%s",
-            account_id, batch_id, message,
+        log_warning(
+            "[Gemini] Chuyển batch #%s sang tài khoản khác: %s",
+            batch_id, message,
         )
         self._set_row(batch_id, account="—", status="PENDING", detail=message)
         QTimer.singleShot(0, self.process_queue)
@@ -1285,6 +1812,9 @@ class GeminiView(QWidget):
                     status_item = self.table_queue.item(row, 4)
                     status_item.setText(status)
                     status_item.setForeground(QColor(self.STATUS_COLORS.get(status, "#e5e7eb")))
+                    status_combo = self.table_queue.cellWidget(row, 4)
+                    if isinstance(status_combo, QComboBox):
+                        self._set_status_combo(status_combo, status)
                 if detail is not None:
                     self.table_queue.item(row, 5).setText(detail)
                     self.table_queue.item(row, 5).setToolTip(detail)
@@ -1327,11 +1857,19 @@ class GeminiView(QWidget):
     def save_config(self):
         if not hasattr(self, "country_checks"):
             return
+        if self.combo_country_template.currentData() is None and not self._changing_country_template:
+            self._custom_country_selection = self._selected_countries()
         config = {
-            "master_file": self.line_master_file.text(),
+            # Keep the old flat fields so an older build can still read the current values.
+            "master_file": "",
             "story_file": self.line_story_file.text(),
-            "master_prompt": self.text_master_prompt.toPlainText(),
+            "master_prompt": self._current_master_prompt(),
             "story": self.text_story.toPlainText(),
+            "master_templates": self.master_templates,
+            "selected_master_template": self.combo_master_template.currentData(),
+            "country_templates": self.country_templates,
+            "selected_country_template": self.combo_country_template.currentData(),
+            "custom_country_selection": self._custom_country_selection,
             "output_dir": self.line_output_dir.text(),
             "threads": self.spin_threads.value(),
             "max_continuations": self.spin_max_continuations.value(),
@@ -1343,8 +1881,13 @@ class GeminiView(QWidget):
             "split_min_words": self.spin_split_min_words.value(),
             "split_max_words": self.spin_split_max_words.value(),
             "split_output_mode": self.combo_split_output_mode.currentData(),
+            "many_split_file": self.line_many_split_file.text(),
+            "many_min_words": self.spin_many_min_words.value(),
+            "many_max_words": self.spin_many_max_words.value(),
+            "many_source_mode": self.combo_many_source_mode.currentData(),
         }
         try:
+            os.makedirs(os.path.dirname(self._config_path()), exist_ok=True)
             with open(self._config_path(), "w", encoding="utf-8") as config_file:
                 json.dump(config, config_file, ensure_ascii=False, indent=2)
         except OSError as exc:
@@ -1355,20 +1898,64 @@ class GeminiView(QWidget):
             with open(self._config_path(), "r", encoding="utf-8") as config_file:
                 config = json.load(config_file)
         except (OSError, ValueError):
+            self._refresh_master_templates()
+            self._refresh_country_templates()
             return
+
+        raw_master_templates = config.get("master_templates", {})
+        if isinstance(raw_master_templates, dict):
+            self.master_templates = {
+                str(name): value for name, value in raw_master_templates.items()
+                if str(name).strip() and isinstance(value, str)
+            }
+        legacy_master_prompt = config.get("master_prompt", "")
+        if not self.master_templates and legacy_master_prompt:
+            legacy_path = config.get("master_file", "")
+            legacy_name = os.path.splitext(os.path.basename(legacy_path))[0] or "Master Prompt cũ"
+            self.master_templates[legacy_name] = legacy_master_prompt
+        selected_master = config.get("selected_master_template", "")
+        if selected_master not in self.master_templates:
+            selected_master = next(iter(self.master_templates), "")
+        self._refresh_master_templates(selected_master)
+
+        raw_country_templates = config.get("country_templates", {})
+        if isinstance(raw_country_templates, dict):
+            self.country_templates = {
+                str(name): [country for country in value if country in self.country_checks]
+                for name, value in raw_country_templates.items()
+                if str(name).strip() and isinstance(value, list)
+            }
+
+        # Migrate configs created by the short-lived story-template implementation.
+        old_story_templates = config.get("story_templates", {})
+        if not self.country_templates and isinstance(old_story_templates, dict):
+            self.country_templates = {
+                str(name): [
+                    country for country in value.get("countries", [])
+                    if country in self.country_checks
+                ]
+                for name, value in old_story_templates.items()
+                if str(name).strip() and isinstance(value, dict)
+            }
+            old_selected_story = config.get("selected_story_template")
+            old_custom_story = config.get("custom_story_config", {})
+            if old_selected_story and isinstance(old_custom_story, dict):
+                config["story"] = old_custom_story.get("story", config.get("story", ""))
+                config["story_file"] = old_custom_story.get(
+                    "story_file", config.get("story_file", "")
+                )
         widgets = (
-            self.line_master_file, self.line_story_file, self.text_master_prompt,
-            self.text_story, self.line_output_dir, self.spin_threads,
+            self.line_story_file, self.text_story, self.line_output_dir, self.spin_threads,
             self.spin_max_continuations, self.line_done_marker,
             self.line_smooth_folder, self.spin_smooth_min_words,
             self.line_split_path, self.spin_split_min_words, self.spin_split_max_words,
             self.combo_split_output_mode,
+            self.line_many_split_file, self.spin_many_min_words, self.spin_many_max_words,
+            self.combo_many_source_mode,
         )
         for widget in widgets:
             widget.blockSignals(True)
-        self.line_master_file.setText(config.get("master_file", ""))
         self.line_story_file.setText(config.get("story_file", ""))
-        self.text_master_prompt.setPlainText(config.get("master_prompt", ""))
         self.text_story.setPlainText(config.get("story", ""))
         self.line_output_dir.setText(config.get("output_dir", ""))
         self.spin_threads.setValue(int(config.get("threads", 1)))
@@ -1383,6 +1970,13 @@ class GeminiView(QWidget):
             config.get("split_output_mode", "new")
         )
         self.combo_split_output_mode.setCurrentIndex(max(0, split_mode_index))
+        self.line_many_split_file.setText(config.get("many_split_file", ""))
+        self.spin_many_min_words.setValue(int(config.get("many_min_words", 6)))
+        self.spin_many_max_words.setValue(int(config.get("many_max_words", 25)))
+        many_source_mode_index = self.combo_many_source_mode.findData(
+            config.get("many_source_mode", "keep")
+        )
+        self.combo_many_source_mode.setCurrentIndex(max(0, many_source_mode_index))
         for widget in widgets:
             widget.blockSignals(False)
         selected = set(config.get("countries", []))
@@ -1390,3 +1984,29 @@ class GeminiView(QWidget):
             checkbox.blockSignals(True)
             checkbox.setChecked(country in selected)
             checkbox.blockSignals(False)
+
+        custom_countries = config.get("custom_country_selection")
+        if not isinstance(custom_countries, list):
+            old_custom_story = config.get("custom_story_config", {})
+            custom_countries = (
+                old_custom_story.get("countries", config.get("countries", []))
+                if isinstance(old_custom_story, dict) else config.get("countries", [])
+            )
+        self._custom_country_selection = [
+            country for country in custom_countries if country in self.country_checks
+        ]
+        selected_country = config.get(
+            "selected_country_template", config.get("selected_story_template")
+        )
+        if selected_country not in self.country_templates:
+            selected_country = None
+        self._refresh_country_templates(selected_country)
+        self._changing_country_template = True
+        try:
+            self._apply_country_selection(
+                self.country_templates[selected_country]
+                if selected_country is not None else self._custom_country_selection
+            )
+        finally:
+            self._changing_country_template = False
+        self.save_config()

@@ -12,9 +12,35 @@ import os
 from data.database import SessionLocal
 from data.models import Task, Account, VideoSession
 from core.workers import AutomationWorker, AUTOMATION_MAX_RETRIES
+from core.account_selection import enabled_accounts_query
+from common.logger import activity, progress as log_progress, warning as log_warning
+from ui.components.prompt_editor import PromptCellWidget, TaskPromptEditDialog
 
 
 from PyQt6.QtWidgets import QDialog, QDialogButtonBox
+
+
+TASK_STATUS_FILTERS = {
+    "Đang chờ": "PENDING",
+    "Đang tạo": "RUNNING",
+    "Hoàn thành": "COMPLETED",
+    "Lỗi": "ERROR",
+}
+
+
+def _task_status_for_filter(filter_text):
+    return TASK_STATUS_FILTERS.get(filter_text)
+
+
+def _task_error_tooltip(error_message, retry_count=None):
+    if not error_message:
+        return ""
+    details = str(error_message).replace(" | ", "\n").strip()
+    lines = ["Chi tiết lỗi Google Labs:"]
+    if retry_count is not None:
+        lines.append(f"Đã retry: {int(retry_count)}/{AUTOMATION_MAX_RETRIES}")
+    lines.append(details)
+    return "\n".join(lines)
 
 class PromptEditDialog(QDialog):
     def __init__(self, parent=None, session_name="", initial_text=""):
@@ -167,10 +193,11 @@ class FlowVideoView(QWidget):
         # Row 1
         self.combo_model = QComboBox()
         self.combo_model.addItems([
-            "Omni Flash",
+            "Omni 1.1 Flash",
             "Veo 3.1 - Lite",
             "Veo 3.1 - Fast",
             "Veo 3.1 - Quality",
+            "Veo 3.1 - Lite [Lower Priority]",
         ])
         config_layout.addWidget(self.combo_model, 1, 0)
         
@@ -190,23 +217,29 @@ class FlowVideoView(QWidget):
         
         # Row 3
         self.combo_ratio = QComboBox()
-        self.combo_ratio.addItems(["16:9 Ngang", "9:16 Dọc", "4:3 Ngang", "3:4 Dọc", "1:1 Vuông"])
+        self.combo_ratio.addItems(["16:9 Ngang", "9:16 Dọc"])
         config_layout.addWidget(self.combo_ratio, 3, 0)
         
         self.spin_images_per_prompt = QSpinBox()
-        self.spin_images_per_prompt.setRange(1, 100)
+        self.spin_images_per_prompt.setRange(1, 4)
         self.spin_images_per_prompt.setValue(1)
         config_layout.addWidget(self.spin_images_per_prompt, 3, 1)
+
+        config_layout.addWidget(QLabel("Thời lượng:"), 4, 0)
+        self.combo_duration = QComboBox()
+        self.combo_duration.addItems(["4s", "6s", "8s"])
+        self.combo_duration.setCurrentText("8s")
+        config_layout.addWidget(self.combo_duration, 5, 0)
         
         # Row 4
-        config_layout.addWidget(QLabel("Số luồng chạy đồng thời:"), 4, 0)
-        config_layout.addWidget(QLabel("Độ trễ giữa các luồng (s):"), 4, 1)
+        config_layout.addWidget(QLabel("Số luồng chạy đồng thời:"), 6, 0)
+        config_layout.addWidget(QLabel("Độ trễ giữa các luồng (s):"), 6, 1)
         
         # Row 5
         self.spin_threads = QSpinBox()
         self.spin_threads.setRange(1, 10)
         self.spin_threads.setValue(1)
-        config_layout.addWidget(self.spin_threads, 5, 0)
+        config_layout.addWidget(self.spin_threads, 7, 0)
         
         delay_layout = QHBoxLayout()
         self.spin_delay_min = QSpinBox()
@@ -218,16 +251,16 @@ class FlowVideoView(QWidget):
         delay_layout.addWidget(self.spin_delay_min)
         delay_layout.addWidget(QLabel("-"))
         delay_layout.addWidget(self.spin_delay_max)
-        config_layout.addLayout(delay_layout, 5, 1)
+        config_layout.addLayout(delay_layout, 7, 1)
         
         # Row 6
-        config_layout.addWidget(QLabel("Chế độ tham chiếu:"), 6, 0)
-        config_layout.addWidget(QLabel("Seed:"), 6, 1)
+        config_layout.addWidget(QLabel("Chế độ tham chiếu:"), 8, 0)
+        config_layout.addWidget(QLabel("Seed:"), 8, 1)
         
         # Row 7
         self.combo_ref_mode = QComboBox()
         self.combo_ref_mode.addItems(["Mặc định", "1 cho tất cả"])
-        config_layout.addWidget(self.combo_ref_mode, 7, 0)
+        config_layout.addWidget(self.combo_ref_mode, 9, 0)
         
         seed_layout = QHBoxLayout()
         self.line_seed = QLineEdit()
@@ -235,7 +268,7 @@ class FlowVideoView(QWidget):
         self.chk_lock_seed = QCheckBox("Khóa seed")
         seed_layout.addWidget(self.line_seed)
         seed_layout.addWidget(self.chk_lock_seed)
-        config_layout.addLayout(seed_layout, 7, 1)
+        config_layout.addLayout(seed_layout, 9, 1)
         
         group_config.setLayout(config_layout)
         left_layout.addWidget(group_config)
@@ -490,7 +523,7 @@ class FlowVideoView(QWidget):
         filter_layout.addWidget(self.lbl_progress_header)
         self.combo_filter = QComboBox()
         self.combo_filter.addItems(["Tất cả", "Đang chọn", "Đang chờ", "Đang tạo", "Hoàn thành", "Lỗi"])
-        self.combo_filter.currentTextChanged.connect(self.filter_table)
+        self.combo_filter.currentTextChanged.connect(self.on_task_filter_changed)
         filter_layout.addWidget(self.combo_filter)
         right_layout.addLayout(filter_layout)
         
@@ -605,6 +638,7 @@ class FlowVideoView(QWidget):
         self.chk_1080p.stateChanged.connect(self.save_config)
         self.chk_4k.stateChanged.connect(self.save_config)
         self.combo_ratio.currentTextChanged.connect(self.save_config)
+        self.combo_duration.currentTextChanged.connect(self.save_config)
         self.spin_images_per_prompt.valueChanged.connect(self.save_config)
         self.spin_threads.valueChanged.connect(self.save_config)
         self.spin_delay_min.valueChanged.connect(self.save_config)
@@ -616,6 +650,7 @@ class FlowVideoView(QWidget):
         self.workers = []
         self.task_queue = []
         self.active_workers_count = 0
+        self.window_slot_count = 1
         self.last_start_time = 0
         self.queue_timer = QTimer(self)
         self.queue_timer.timeout.connect(self.process_queue)
@@ -1109,7 +1144,7 @@ class FlowVideoView(QWidget):
         if status == "COMPLETED" and result_path and os.path.exists(result_path):
             btn = QPushButton("📁")
             btn.setFixedSize(28, 28)
-            btn.setToolTip("Mở thư mục chứa ảnh")
+            btn.setToolTip("Mở thư mục chứa video")
             btn.clicked.connect(lambda _, p=result_path: self.open_containing_folder(p))
             btn.setStyleSheet("""
                 QPushButton {
@@ -1125,6 +1160,16 @@ class FlowVideoView(QWidget):
         return widget
 
     def on_session_filter_changed(self):
+        self.current_page = 1
+        self.load_tasks()
+
+    def on_task_filter_changed(self, filter_text):
+        # "Đang chọn" phụ thuộc checkbox của các dòng hiện tại. Các trạng thái
+        # còn lại phải lọc từ DB trước khi phân trang, nếu không lỗi ở trang sau
+        # sẽ không bao giờ xuất hiện khi đang đứng ở trang đầu.
+        if filter_text == "Đang chọn":
+            self.filter_table()
+            return
         self.current_page = 1
         self.load_tasks()
 
@@ -1159,14 +1204,22 @@ class FlowVideoView(QWidget):
         if hasattr(self, 'combo_session_filter') and self.combo_session_filter.currentIndex() > 0:
             selected_sess_id = self.combo_session_filter.currentData()
             
-        # Query tasks for this type
-        query = db.query(Task).filter(Task.task_type == "video")
+        # Query tasks for this type/session. Keep progress totals independent
+        # from the active table filter.
+        base_query = db.query(Task).filter(Task.task_type == "video")
         if selected_sess_id is not None:
-            query = query.filter(Task.session_id == selected_sess_id)
+            base_query = base_query.filter(Task.session_id == selected_sess_id)
 
-        total_count = query.count()
-        completed_count = query.filter(Task.status == "COMPLETED").count()
-        self.total_pages = max(1, (total_count + self.page_size - 1) // self.page_size)
+        total_count = base_query.count()
+        completed_count = base_query.filter(Task.status == "COMPLETED").count()
+        query = base_query
+        if hasattr(self, "combo_filter"):
+            target_status = _task_status_for_filter(self.combo_filter.currentText())
+            if target_status:
+                query = query.filter(Task.status.like(f"{target_status}%"))
+
+        filtered_count = query.count()
+        self.total_pages = max(1, (filtered_count + self.page_size - 1) // self.page_size)
         self.current_page = min(max(1, self.current_page), self.total_pages)
         page_offset = (self.current_page - 1) * self.page_size
         tasks = query.order_by(Task.id.asc()).offset(page_offset).limit(self.page_size).all()
@@ -1196,7 +1249,12 @@ class FlowVideoView(QWidget):
 
             prompt_item = QTableWidgetItem(task.prompt)
             prompt_item.setData(Qt.ItemDataRole.UserRole, task.id)
+            prompt_item.setFlags(prompt_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.table_tasks.setItem(row_idx, 3, prompt_item)
+            self.table_tasks.setCellWidget(
+                row_idx, 3,
+                PromptCellWidget(task.id, task.prompt, self.edit_task_prompt),
+            )
 
             result_item = QTableWidgetItem(task.result_path or "")
             result_item.setFlags(result_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
@@ -1208,6 +1266,10 @@ class FlowVideoView(QWidget):
 
             status_item = QTableWidgetItem(task.status)
             status_item.setFlags(status_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            if task.error_message:
+                status_item.setToolTip(
+                    _task_error_tooltip(task.error_message, task.retry_count or 0)
+                )
             self.table_tasks.setItem(row_idx, 5, status_item)
             if task.status == "COMPLETED":
                 self.table_tasks.setCellWidget(row_idx, 5, self.create_status_widget(task.status, task.result_path))
@@ -1232,6 +1294,56 @@ class FlowVideoView(QWidget):
                     db.commit()
                 db.close()
         
+    def edit_task_prompt(self, task_id):
+        db = SessionLocal()
+        try:
+            task = db.query(Task).filter(Task.id == task_id).first()
+            if not task:
+                QMessageBox.warning(self, "Không tìm thấy", "Task này không còn tồn tại.")
+                return
+            if task.status == "RUNNING":
+                QMessageBox.information(
+                    self, "Task đang chạy",
+                    "Không thể sửa prompt khi task đang chạy. Hãy dừng task trước.",
+                )
+                return
+            dialog = TaskPromptEditDialog(task.prompt, self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            prompt = dialog.prompt()
+            if task.session_id:
+                session = db.query(VideoSession).filter(
+                    VideoSession.id == task.session_id
+                ).first()
+                session_tasks = db.query(Task).filter(
+                    Task.session_id == task.session_id,
+                    Task.task_type == "video",
+                ).order_by(Task.id.asc()).all()
+                task_ids = [item.id for item in session_tasks]
+                prompts = [
+                    value.strip() for value in (session.prompts_text or "").splitlines()
+                    if value.strip()
+                ] if session else []
+                if session and len(prompts) == len(task_ids) and task_id in task_ids:
+                    prompts[task_ids.index(task_id)] = prompt
+                    session.prompts_text = "\n".join(prompts)
+                    session.status = "PENDING"
+            task.prompt = prompt
+            task.status = "PENDING"
+            task.result_path = None
+            task.account_id = None
+            task.retry_count = 0
+            task.error_message = None
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            logging.error("[Flow Video] Không thể lưu prompt task #%s: %s", task_id, exc)
+            QMessageBox.critical(self, "Không thể lưu", f"Lỗi khi lưu prompt:\n{exc}")
+            return
+        finally:
+            db.close()
+        self.load_tasks()
+
     def filter_table(self):
         filter_text = self.combo_filter.currentText()
         for i in range(self.table_tasks.rowCount()):
@@ -1249,8 +1361,7 @@ class FlowVideoView(QWidget):
             status_item = self.table_tasks.item(i, 5)
             if status_item:
                 status = status_item.text()
-                mapping = {"Đang chờ": "PENDING", "Đang tạo": "RUNNING", "Hoàn thành": "COMPLETED", "Lỗi": "ERROR"}
-                target_status = mapping.get(filter_text, "")
+                target_status = _task_status_for_filter(filter_text) or ""
                 self.table_tasks.setRowHidden(i, target_status not in status)
 
     def add_to_queue(self):
@@ -1342,6 +1453,7 @@ class FlowVideoView(QWidget):
                     t.status = "PENDING"
                     t.result_path = None
                     t.retry_count = 0
+                    t.error_message = None
                     
                 t.reference_image = ref_image_path
                 
@@ -1353,10 +1465,10 @@ class FlowVideoView(QWidget):
         logging.info("[UI] Bắt đầu chạy tuần tự theo phiên.")
         
         db = SessionLocal()
-        active_account = db.query(Account).filter(Account.is_active == True).order_by(Account.position.asc()).first()
+        active_account = enabled_accounts_query(db, "video").first()
         db.close()
         if not active_account:
-            QMessageBox.warning(self, "Thiếu tài khoản", "Vui lòng thêm hoặc kích hoạt ít nhất một tài khoản ở tab 'Cài đặt hệ thống'!")
+            QMessageBox.warning(self, "Thiếu tài khoản", "Vui lòng tích cột Video cho ít nhất một tài khoản ở tab 'Cài đặt hệ thống'!")
             return
 
         selected_sess_ids = []
@@ -1495,6 +1607,7 @@ class FlowVideoView(QWidget):
                 "model": self.combo_model.currentText(),
                 "quality": [q.text() for q in [self.chk_720p, self.chk_1080p, self.chk_4k] if q.isChecked()],
                 "aspect_ratio": self.combo_ratio.currentText(),
+                "duration": self.combo_duration.currentText(),
                 "images_per_prompt": self.spin_images_per_prompt.value(),
                 "save_path": sess_save_dir
             }
@@ -1509,6 +1622,9 @@ class FlowVideoView(QWidget):
         db.close()
         
         if not self.queue_timer.isActive():
+            self.window_slot_count = max(
+                1, min(self.spin_threads.value(), len(self.task_queue))
+            )
             self.set_running_buttons_enabled()
             self.queue_timer.start(1000)
             self.process_queue()
@@ -1537,8 +1653,8 @@ class FlowVideoView(QWidget):
         else:
             msg_box = QMessageBox(self)
             msg_box.setWindowTitle("Chạy lại phiên")
-            msg_box.setText(f"Phiên '{sess.name}' có {len(err_tasks)} ảnh bị lỗi. Bạn muốn:")
-            btn_err = msg_box.addButton("Chỉ chạy lại ảnh lỗi", QMessageBox.ButtonRole.ActionRole)
+            msg_box.setText(f"Phiên '{sess.name}' có {len(err_tasks)} video bị lỗi. Bạn muốn:")
+            btn_err = msg_box.addButton("Chỉ chạy lại video lỗi", QMessageBox.ButtonRole.ActionRole)
             btn_all = msg_box.addButton("Chạy lại toàn bộ phiên", QMessageBox.ButtonRole.ActionRole)
             btn_cancel = msg_box.addButton("Hủy", QMessageBox.ButtonRole.RejectRole)
             
@@ -1554,11 +1670,15 @@ class FlowVideoView(QWidget):
                 
         if mode == "error":
             db.query(Task).filter(Task.session_id == sess_id, Task.status.like("ERROR%")).update(
-                {"status": "PENDING", "retry_count": 0}, synchronize_session=False
+                {"status": "PENDING", "retry_count": 0, "error_message": None},
+                synchronize_session=False,
             )
         else:
             db.query(Task).filter(Task.session_id == sess_id).update(
-                {"status": "PENDING", "result_path": None, "retry_count": 0},
+                {
+                    "status": "PENDING", "result_path": None,
+                    "retry_count": 0, "error_message": None,
+                },
                 synchronize_session=False,
             )
             
@@ -1702,6 +1822,21 @@ class FlowVideoView(QWidget):
         
         if self.active_workers_count < max_threads:
             if current_time - self.last_start_time >= delay_s or self.active_workers_count == 0:
+                active_workers = [w for w in self.workers if w.isRunning()]
+                used_window_slots = {
+                    w.window_slot for w in active_workers
+                    if hasattr(w, "window_slot")
+                }
+                window_slot = next(
+                    (
+                        slot for slot in range(self.window_slot_count)
+                        if slot not in used_window_slots
+                    ),
+                    None,
+                )
+                if window_slot is None:
+                    return
+
                 task_info = self.task_queue.pop(0)
                 
                 worker_config = task_info.get('config', getattr(self, 'base_config', {}).copy()).copy()
@@ -1710,14 +1845,14 @@ class FlowVideoView(QWidget):
                 # Phân bổ tài khoản thông minh (Load balancing)
                 # 1. Lấy danh sách các tài khoản active từ DB
                 db = SessionLocal()
-                active_accounts = db.query(Account).filter(Account.is_active == True).order_by(Account.position.asc()).all()
+                active_accounts = enabled_accounts_query(db, "video").all()
                 queued_task = db.query(Task).filter(Task.id == task_info['task_id']).first()
                 previous_account_id = task_info.get('avoid_account_id')
                 if (previous_account_id is None and queued_task
                         and (queued_task.retry_count or 0) > 0):
                     previous_account_id = queued_task.account_id
                 db.close()
-                
+
                 selected_account_id = None
                 if active_accounts:
                     # 2. Đếm số lượng tasks đang chạy của từng tài khoản active
@@ -1746,7 +1881,12 @@ class FlowVideoView(QWidget):
                     selected_account_id = selected_account.id
                     logging.info(f"[Queue] Phân bổ tài khoản {selected_account.email} (đang chạy {account_task_counts[selected_account.id]} luồng) cho Task ID {task_info['task_id']}")
                 
-                worker = AutomationWorker(task_info['task_id'], task_info['target'], worker_config, account_id=selected_account_id)
+                worker = AutomationWorker(
+                    task_info['task_id'], task_info['target'], worker_config,
+                    account_id=selected_account_id,
+                    window_slot=window_slot,
+                    window_count=self.window_slot_count,
+                )
                 worker.progress.connect(self.update_task_status)
                 worker.task_finished.connect(self.on_task_finished)
                 worker.error.connect(self.on_task_error)
@@ -1765,7 +1905,7 @@ class FlowVideoView(QWidget):
 
     def pause_tasks(self):
         if "TẠM DỪNG" in self.btn_pause.text():
-            logging.info("[UI] Tạm dừng các tasks.")
+            activity("[Flow Video] Đã tạm dừng")
             self.anim_timer.stop()
             self.hourglass_icon = "⏳"
             self.update_stats_display()
@@ -1792,7 +1932,7 @@ class FlowVideoView(QWidget):
                 }
             """)
         else:
-            logging.info("[UI] Tiếp tục chạy các tasks.")
+            activity("[Flow Video] Tiếp tục chạy")
             self.anim_timer.start(500)
             if getattr(self, 'queue_timer', None):
                 self.queue_timer.start(1000)
@@ -1818,7 +1958,7 @@ class FlowVideoView(QWidget):
             """)
 
     def stop_tasks(self):
-        logging.info("[UI] Dừng toàn bộ các tasks và xóa hàng chờ.")
+        activity("[Flow Video] Đang dừng toàn bộ tác vụ")
         if getattr(self, 'queue_timer', None) and self.queue_timer.isActive():
             self.queue_timer.stop()
         self.task_queue.clear()
@@ -1896,6 +2036,10 @@ class FlowVideoView(QWidget):
             clean_status = status.lstrip("⏳⌛ ").strip()
             status = f"{self.hourglass_icon} {clean_status}"
         self.update_table_row(task_id, 5, status)
+        log_progress(
+            "Flow Video", self.stats_processed, self.stats_total,
+            f"Task #{task_id}: {status}",
+        )
 
     def on_task_finished(self, task_id, result_path):
         self.update_table_row(task_id, 4, result_path)
@@ -1903,29 +2047,46 @@ class FlowVideoView(QWidget):
         self.stats_processed += 1
         self.stats_success += 1
         self.update_stats_display()
+        log_progress(
+            "Flow Video", self.stats_processed, self.stats_total,
+            f"Hoàn thành task #{task_id}",
+        )
         self.check_and_advance_batch_session(task_id)
 
     def on_task_retry(self, task_id, account_id, retry_number, error_msg, task_info):
         task_info['avoid_account_id'] = account_id
         if not any(item['task_id'] == task_id for item in self.task_queue):
             self.task_queue.append(task_info)
-        logging.warning(
-            "[Video Queue] Task %s retry %s/%s; tránh account %s ở lượt kế; queue=%s",
-            task_id, retry_number, AUTOMATION_MAX_RETRIES,
-            account_id, [item['task_id'] for item in self.task_queue],
+        log_warning(
+            "[Flow Video] Task #%s lỗi, thử lại %s/%s: %s",
+            task_id, retry_number, AUTOMATION_MAX_RETRIES, error_msg,
         )
         self.update_table_row(
             task_id, 5,
-            f"PENDING - Retry {retry_number}/{AUTOMATION_MAX_RETRIES}: {error_msg}",
+            f"PENDING - Retry {retry_number}/{AUTOMATION_MAX_RETRIES}",
+            tooltip=_task_error_tooltip(error_msg, retry_number),
         )
         if not self.queue_timer.isActive():
             self.queue_timer.start(1000)
 
     def on_task_error(self, task_id, error_msg):
-        self.update_table_row(task_id, 5, f"ERROR: {error_msg}")
+        db = SessionLocal()
+        task = db.query(Task).filter(Task.id == task_id).first()
+        retry_count = task.retry_count if task else 0
+        db.close()
+        self.update_table_row(
+            task_id, 5, "ERROR",
+            tooltip=_task_error_tooltip(error_msg, retry_count or 0),
+        )
+        if self.combo_filter.currentText() == "Lỗi":
+            self.load_tasks()
         self.stats_processed += 1
         self.stats_failure += 1
         self.update_stats_display()
+        logging.error(
+            "[Flow Video] Task #%s thất bại (%s/%s): %s",
+            task_id, self.stats_processed, self.stats_total, error_msg,
+        )
         self.check_and_advance_batch_session(task_id)
         
     def animate_hourglass(self):
@@ -1954,7 +2115,7 @@ class FlowVideoView(QWidget):
         # Cập nhật label tiến độ trên filter bar
         self.lbl_progress_header.setText(f"Tiến độ({self.stats_success}/{self.stats_total}):")
 
-    def update_table_row(self, task_id, col, text):
+    def update_table_row(self, task_id, col, text, tooltip=None):
         for i in range(self.table_tasks.rowCount()):
             item = self.table_tasks.item(i, 1)
             if item and item.data(Qt.ItemDataRole.UserRole) == task_id:
@@ -1971,6 +2132,8 @@ class FlowVideoView(QWidget):
                     self.table_tasks.removeCellWidget(i, col)
                     status_item = QTableWidgetItem(text)
                     status_item.setFlags(status_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    if tooltip:
+                        status_item.setToolTip(tooltip)
                     self.table_tasks.setItem(i, col, status_item)
                     result_item = self.table_tasks.item(i, 4)
                     result_path = result_item.text() if result_item else ""
@@ -2053,6 +2216,7 @@ class FlowVideoView(QWidget):
             "quality_2k": self.chk_1080p.isChecked(),
             "quality_4k": self.chk_4k.isChecked(),
             "aspect_ratio": self.combo_ratio.currentText(),
+            "duration": self.combo_duration.currentText(),
             "images_per_prompt": self.spin_images_per_prompt.value(),
             "threads": self.spin_threads.value(),
             "delay_min": self.spin_delay_min.value(),
@@ -2082,6 +2246,7 @@ class FlowVideoView(QWidget):
             self.chk_1080p.blockSignals(True)
             self.chk_4k.blockSignals(True)
             self.combo_ratio.blockSignals(True)
+            self.combo_duration.blockSignals(True)
             self.spin_images_per_prompt.blockSignals(True)
             self.spin_threads.blockSignals(True)
             self.spin_delay_min.blockSignals(True)
@@ -2090,14 +2255,17 @@ class FlowVideoView(QWidget):
             self.chk_lock_seed.blockSignals(True)
             self.line_seed.blockSignals(True)
             
-            saved_model = config.get("model", "Omni Flash")
+            saved_model = config.get("model", "Omni 1.1 Flash")
+            if saved_model == "Omni Flash":
+                saved_model = "Omni 1.1 Flash"
             if self.combo_model.findText(saved_model) < 0:
-                saved_model = "Omni Flash"
+                saved_model = "Omni 1.1 Flash"
             self.combo_model.setCurrentText(saved_model)
             self.chk_720p.setChecked(config.get("quality_1k", True))
             self.chk_1080p.setChecked(config.get("quality_2k", False))
             self.chk_4k.setChecked(config.get("quality_4k", False))
             self.combo_ratio.setCurrentText(config.get("aspect_ratio", "16:9 Ngang"))
+            self.combo_duration.setCurrentText(config.get("duration", "8s"))
             self.spin_images_per_prompt.setValue(config.get("images_per_prompt", 1))
             self.spin_threads.setValue(config.get("threads", 1))
             self.spin_delay_min.setValue(config.get("delay_min", 10))
@@ -2111,6 +2279,7 @@ class FlowVideoView(QWidget):
             self.chk_1080p.blockSignals(False)
             self.chk_4k.blockSignals(False)
             self.combo_ratio.blockSignals(False)
+            self.combo_duration.blockSignals(False)
             self.spin_images_per_prompt.blockSignals(False)
             self.spin_threads.blockSignals(False)
             self.spin_delay_min.blockSignals(False)
@@ -2127,10 +2296,10 @@ class FlowVideoView(QWidget):
         logging.info("[UI] Nhấn Chạy mục chọn.")
         
         db = SessionLocal()
-        active_account = db.query(Account).filter(Account.is_active == True).order_by(Account.position.asc()).first()
+        active_account = enabled_accounts_query(db, "video").first()
         db.close()
         if not active_account:
-            QMessageBox.warning(self, "Thiếu tài khoản", "Vui lòng thêm hoặc kích hoạt ít nhất một tài khoản ở tab 'Cài đặt hệ thống'!")
+            QMessageBox.warning(self, "Thiếu tài khoản", "Vui lòng tích cột Video cho ít nhất một tài khoản ở tab 'Cài đặt hệ thống'!")
             return
 
         selected_task_ids = []
@@ -2188,6 +2357,7 @@ class FlowVideoView(QWidget):
             "model": self.combo_model.currentText(),
             "quality": [q.text() for q in [self.chk_720p, self.chk_1080p, self.chk_4k] if q.isChecked()],
             "aspect_ratio": self.combo_ratio.currentText(),
+            "duration": self.combo_duration.currentText(),
             "images_per_prompt": self.spin_images_per_prompt.value(),
             "save_path": save_path
         }
@@ -2207,6 +2377,9 @@ class FlowVideoView(QWidget):
                         })
                         
         if not self.queue_timer.isActive():
+            self.window_slot_count = max(
+                1, min(self.spin_threads.value(), len(self.task_queue))
+            )
             self.set_running_buttons_enabled()
             self.queue_timer.start(1000)
             self.process_queue()
@@ -2215,10 +2388,10 @@ class FlowVideoView(QWidget):
         logging.info("[UI] Nhấn Chạy lại lỗi.")
         
         db = SessionLocal()
-        active_account = db.query(Account).filter(Account.is_active == True).order_by(Account.position.asc()).first()
+        active_account = enabled_accounts_query(db, "video").first()
         db.close()
         if not active_account:
-            QMessageBox.warning(self, "Thiếu tài khoản", "Vui lòng thêm hoặc kích hoạt ít nhất một tài khoản ở tab 'Cài đặt hệ thống'!")
+            QMessageBox.warning(self, "Thiếu tài khoản", "Vui lòng tích cột Video cho ít nhất một tài khoản ở tab 'Cài đặt hệ thống'!")
             return
 
         db = SessionLocal()
@@ -2231,6 +2404,7 @@ class FlowVideoView(QWidget):
             task.status = "PENDING"
             task.result_path = None
             task.retry_count = 0
+            task.error_message = None
         if session_ids:
             db.query(VideoSession).filter(VideoSession.id.in_(session_ids)).update(
                 {"status": "PENDING"}, synchronize_session=False
@@ -2272,24 +2446,23 @@ class FlowVideoView(QWidget):
             for idx, task in enumerate(tasks):
                 stt = str(idx + 1)
                 
-                image_exists = False
+                video_exists = False
                 found_path = None
                 
                 possible_names = [
-                    f"{stt}.png", f"{stt}.jpg", 
-                    f"{stt}_2K.png", f"{stt}_2K.jpg", 
-                    f"{stt}_4K.png", f"{stt}_4K.jpg", 
-                    f"{stt}_1K.png", f"{stt}_1K.jpg"
+                    f"{stt}_720p.mp4",
+                    f"{stt}_1080p.mp4",
+                    f"{stt}_4K.mp4",
                 ]
                 
                 for name in possible_names:
                     p = os.path.join(save_path, name)
                     if os.path.exists(p):
-                        image_exists = True
+                        video_exists = True
                         found_path = p
                         break
                         
-                if image_exists:
+                if video_exists:
                     if task.status != "COMPLETED" or task.result_path != found_path:
                         task.status = "COMPLETED"
                         task.result_path = found_path
@@ -2306,4 +2479,8 @@ class FlowVideoView(QWidget):
         
         self.load_sessions()
         self.load_tasks()
-        QMessageBox.information(self, "Thành công", f"Đã quét và cập nhật trạng thái {updated_count} ảnh từ tất cả các phiên!")
+        QMessageBox.information(
+            self,
+            "Thành công",
+            f"Đã quét và cập nhật trạng thái {updated_count} video từ tất cả các phiên!",
+        )

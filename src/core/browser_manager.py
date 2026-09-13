@@ -5,6 +5,323 @@ import re
 import logging
 import threading
 import time
+import base64
+import select
+import socketserver
+import urllib.request
+import zlib
+
+from common.urban_vpn import DIRECT_CODE
+
+
+URBAN_VPN_EXTENSION_ID = "eppiocemhmnlbhjplcgkofciiegomcon"
+URBAN_VPN_CLIENT_APP = "URBAN_VPN_BROWSER_EXTENSION"
+URBAN_VPN_API = "https://api-pro.urban-vpn.com/rest/v1"
+
+_urban_token_lock = threading.Lock()
+_urban_cached_security_token = None
+_urban_cached_security_token_expires_at = 0.0
+
+
+def _urban_vpn_security_tokens(extension_path):
+    source_profile = os.path.dirname(os.path.dirname(os.path.dirname(extension_path)))
+    storage_dir = os.path.join(
+        source_profile, "Local Extension Settings", URBAN_VPN_EXTENSION_ID
+    )
+    patterns = (
+        re.compile(
+            rb'AUTH_ANONYMOUS_SECURITY_TOKEN.{0,96}?\\"type\\":\\"accs\\",'
+            rb'\\"value\\":\\"([^"\\]+)', re.S
+        ),
+        re.compile(
+            rb'AUTH_ANONYMOUS_SECURITY_TOKEN.{0,96}?"type":"accs",'
+            rb'"value":"([^"\\]+)', re.S
+        ),
+    )
+    tokens = []
+    if not os.path.isdir(storage_dir):
+        return tokens
+    files = sorted(
+        (os.path.join(storage_dir, name) for name in os.listdir(storage_dir)
+         if name != "LOCK"),
+        key=lambda path: os.path.getmtime(path) if os.path.exists(path) else 0,
+    )
+    for path in files:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "rb") as stream:
+                data = stream.read()
+        except OSError:
+            continue
+        for pattern in patterns:
+            for match in pattern.finditer(data):
+                token = match.group(1).decode("ascii", errors="ignore")
+                if token and token not in tokens:
+                    tokens.append(token)
+    return tokens
+
+
+def _urban_request_json(url, security_token, method="GET", payload=None):
+    body = None if payload is None else json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(url, data=body, method=method)
+    if security_token:
+        request.add_header("Authorization", f"Bearer {security_token}")
+    request.add_header("X-Client-App", URBAN_VPN_CLIENT_APP)
+    request.add_header("Accept", "application/json")
+    request.add_header("Origin", f"chrome-extension://{URBAN_VPN_EXTENSION_ID}")
+    if body is not None:
+        request.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(request, timeout=25) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _urban_security_token_is_current(token, skew_seconds=60):
+    """Read the JWT expiry locally so stale LevelDB entries are not retried."""
+    try:
+        payload = token.split(".")[1]
+        raw = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+        try:
+            raw = zlib.decompress(raw)
+        except zlib.error:
+            raw = zlib.decompress(raw, -zlib.MAX_WBITS)
+        expires_at = float(json.loads(raw).get("exp", 0))
+        return expires_at > time.time() + skew_seconds
+    except Exception:
+        # Unknown token formats are still worth checking with the server.
+        return True
+
+
+def _refresh_urban_vpn_security_token():
+    """Create/refresh Urban VPN's anonymous token without user interaction."""
+    global _urban_cached_security_token, _urban_cached_security_token_expires_at
+
+    with _urban_token_lock:
+        if (
+            _urban_cached_security_token
+            and _urban_cached_security_token_expires_at > time.time() + 60
+        ):
+            return _urban_cached_security_token
+
+        anonymous_auth = _urban_request_json(
+            f"{URBAN_VPN_API}/registrations/clientApps/"
+            f"{URBAN_VPN_CLIENT_APP}/users/anonymous",
+            None,
+            method="POST",
+            payload={
+                "clientApp": {
+                    "name": URBAN_VPN_CLIENT_APP,
+                    "browser": "CHROME",
+                }
+            },
+        )
+        auth_value = anonymous_auth.get("value")
+        if not auth_value:
+            raise RuntimeError("Urban VPN không cấp anonymous auth token.")
+
+        security = _urban_request_json(
+            f"{URBAN_VPN_API}/security/tokens/accs",
+            auth_value,
+            method="POST",
+            payload={
+                "type": "accs",
+                "clientApp": {"name": URBAN_VPN_CLIENT_APP},
+            },
+        )
+        security_value = security.get("value")
+        if not security_value:
+            raise RuntimeError("Urban VPN không cấp anonymous security token.")
+
+        expires_at = security.get("expirationTime")
+        try:
+            expires_at = float(expires_at) / 1000
+        except (TypeError, ValueError):
+            expires_at = time.time() + 50 * 60
+        _urban_cached_security_token = security_value
+        _urban_cached_security_token_expires_at = expires_at
+        logging.info("[Urban VPN] Đã tự làm mới phiên anonymous thành công.")
+        return security_value
+
+
+def resolve_urban_vpn_proxy(country_code):
+    """Resolve one currently accessible free Urban endpoint and credentials."""
+    code = str(country_code or "").upper()
+    extension_path = find_urban_vpn_extension()
+    tokens = _urban_vpn_security_tokens(extension_path) if extension_path else []
+    tokens = [token for token in tokens if _urban_security_token_is_current(token)]
+
+    if (
+        _urban_cached_security_token
+        and _urban_cached_security_token_expires_at > time.time() + 60
+        and _urban_cached_security_token not in tokens
+    ):
+        tokens.append(_urban_cached_security_token)
+
+    countries = None
+    active_token = None
+    for token in reversed(tokens):
+        try:
+            countries = _urban_request_json(
+                "https://stats.urban-vpn.com/api/rest/v2/entrypoints/countries",
+                token,
+            )
+            active_token = token
+            break
+        except Exception:
+            continue
+    if not countries or not active_token:
+        try:
+            active_token = _refresh_urban_vpn_security_token()
+            countries = _urban_request_json(
+                "https://stats.urban-vpn.com/api/rest/v2/entrypoints/countries",
+                active_token,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Không thể tự làm mới phiên anonymous của Urban VPN: {exc}"
+            ) from exc
+
+    entries = countries.get("countries", {}).get("elements", [])
+    country = next(
+        (item for item in entries
+         if item.get("code", {}).get("iso2", "").upper() == code),
+        None,
+    )
+    if not country or country.get("accessType") != "ACCESSIBLE":
+        raise RuntimeError(f"Urban VPN hiện không có điểm miễn phí khả dụng cho {code}.")
+    servers = [
+        server for server in country.get("servers", {}).get("elements", [])
+        if server.get("accessType") == "ACCESSIBLE" and not server.get("premium", False)
+        and server.get("address", {}).get("primary", {}).get("host")
+    ]
+    if not servers:
+        raise RuntimeError(f"Urban VPN hiện không có proxy miễn phí khả dụng cho {code}.")
+    server = max(servers, key=lambda item: int(item.get("weight") or 0))
+    auth = _urban_request_json(
+        f"{URBAN_VPN_API}/security/tokens/accs-proxy",
+        active_token,
+        method="POST",
+        payload={
+            "type": "accs-proxy",
+            "clientApp": {"name": "URBAN_VPN_BROWSER_EXTENSION"},
+            "signature": server["signature"],
+        },
+    )
+    address = server["address"]["primary"]
+    return {
+        "host": address["host"],
+        "port": int(address["port"]),
+        "username": auth["value"],
+        "password": "1",
+        "country": code,
+    }
+
+
+class _ProxyRelayHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        remote = None
+        try:
+            upstream = self.server.upstream
+            self.request.settimeout(15)
+            data = b""
+            while b"\r\n\r\n" not in data and len(data) < 65536:
+                chunk = self.request.recv(8192)
+                if not chunk:
+                    return
+                data += chunk
+            header, _, remainder = data.partition(b"\r\n\r\n")
+            lines = header.split(b"\r\n")
+            if not lines:
+                return
+            auth_value = base64.b64encode(
+                f"{upstream['username']}:{upstream['password']}".encode("utf-8")
+            )
+            injected = b"Proxy-Authorization: Basic " + auth_value
+            filtered = [line for line in lines[1:]
+                        if not line.lower().startswith(b"proxy-authorization:")]
+            request_bytes = (
+                b"\r\n".join([lines[0], injected, *filtered])
+                + b"\r\n\r\n" + remainder
+            )
+            remote = __import__("socket").create_connection(
+                (upstream["host"], upstream["port"]), timeout=15
+            )
+            remote.sendall(request_bytes)
+            sockets = [self.request, remote]
+            while True:
+                readable, _, exceptional = select.select(sockets, [], sockets, 30)
+                if exceptional or not readable:
+                    break
+                for sock in readable:
+                    payload = sock.recv(65536)
+                    if not payload:
+                        return
+                    (remote if sock is self.request else self.request).sendall(payload)
+        except (ConnectionError, OSError):
+            # Chrome commonly closes speculative/background connections. That
+            # is normal and should not print socketserver tracebacks.
+            return
+        finally:
+            if remote:
+                try:
+                    remote.close()
+                except OSError:
+                    pass
+
+
+class AuthenticatedProxyRelay:
+    def __init__(self, upstream):
+        relay_class = type(
+            "UrbanProxyRelayServer",
+            (socketserver.ThreadingMixIn, socketserver.TCPServer),
+            {"allow_reuse_address": True, "daemon_threads": True},
+        )
+        self.server = relay_class(("127.0.0.1", 0), _ProxyRelayHandler)
+        self.server.upstream = upstream
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    @property
+    def address(self):
+        host, port = self.server.server_address
+        return f"{host}:{port}"
+
+    def start(self):
+        self.thread.start()
+        return self
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+
+def find_urban_vpn_extension():
+    """Find the newest installed Urban VPN extension in local Chrome profiles."""
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if not local_app_data:
+        return None
+    user_data_root = os.path.join(local_app_data, "Google", "Chrome", "User Data")
+    candidates = []
+    if not os.path.isdir(user_data_root):
+        return None
+    for profile_name in os.listdir(user_data_root):
+        extension_root = os.path.join(
+            user_data_root, profile_name, "Extensions", URBAN_VPN_EXTENSION_ID
+        )
+        if not os.path.isdir(extension_root):
+            continue
+        for version in os.listdir(extension_root):
+            candidate = os.path.join(extension_root, version)
+            if os.path.isfile(os.path.join(candidate, "manifest.json")):
+                version_key = tuple(int(part) for part in re.findall(r"\d+", version))
+                # Profile 69 is the configured source profile that owns the
+                # working Urban VPN session. Prefer it when versions tie.
+                source_priority = 1 if profile_name == "Profile 69" else 0
+                candidates.append((version_key, source_priority, candidate))
+    return max(
+        candidates, default=(None, None, None),
+        key=lambda item: (item[1], item[0]),
+    )[2]
 
 
 # ── Theo dõi các tiến trình Chrome do bot mở ──────────────────────────────────
@@ -256,6 +573,27 @@ def calculate_tiled_window_bounds(slot_index, slot_count, work_area=None):
     return x, top, max(1, next_x - x), height
 
 
+def apply_browser_mode_args(chrome_args, browser_mode, tile_bounds=None):
+    """Add Chrome CLI flags for one of the three automatic-run display modes."""
+    if browser_mode == "headless":
+        # Chrome is launched natively and Playwright connects over CDP, so this
+        # is the native equivalent of Playwright's headless=True.
+        chrome_args.extend(("--headless=new", "--window-size=1280,720"))
+    elif browser_mode == "minimized":
+        chrome_args.extend((
+            "--start-minimized",
+            "--window-position=-32000,-32000",
+            "--window-size=1280,720",
+        ))
+    elif tile_bounds is not None:
+        tile_x, tile_y, tile_width, tile_height = tile_bounds
+        chrome_args.extend((
+            f"--window-position={tile_x},{tile_y}",
+            f"--window-size={tile_width},{tile_height}",
+        ))
+    return chrome_args
+
+
 def _tile_chrome_window(pid, bounds):
     """Keep a newly launched Chrome window in its assigned screen column."""
     import time
@@ -500,7 +838,8 @@ def kill_chrome_processes_by_profile(user_data_dir):
 
 def launch_chrome_and_connect(
     p, email, chrome_profile, proxy_str=None, task_id=None, window_slot=None,
-    show_browser=None, preserve_profile_data=False,
+    show_browser=None, preserve_profile_data=False, urban_vpn_country=DIRECT_CODE,
+    browser_mode=None,
 ):
     """
     Khởi chạy Google Chrome gốc qua subprocess với cổng gỡ lỗi từ xa ngẫu nhiên
@@ -524,7 +863,13 @@ def launch_chrome_and_connect(
             )
         except Exception as exc:
             logging.warning("[Browser] window_slot không hợp lệ %r: %s", window_slot, exc)
-    hide_browser = task_id is not None and not bool(show_browser) and tile_bounds is None
+    if browser_mode not in {"visible", "minimized", "headless"}:
+        browser_mode = "visible" if bool(show_browser) else "minimized"
+    is_automatic_run = task_id is not None
+    headless_browser = is_automatic_run and browser_mode == "headless"
+    hide_browser = (
+        is_automatic_run and browser_mode == "minimized" and tile_bounds is None
+    )
     
     chrome_path = get_chrome_path()
     if not chrome_path:
@@ -532,9 +877,21 @@ def launch_chrome_and_connect(
         
     # Gemini cần giữ cookie/lịch sử qua nhiều batch, nên dùng profile bền vững thay vì
     # mirror riêng theo task. Ảnh/Video không truyền cờ này và giữ nguyên hành vi cũ.
+    vpn_country = str(urban_vpn_country or DIRECT_CODE).upper()
+    vpn_relay = None
+    effective_proxy_str = proxy_str
+    if vpn_country != DIRECT_CODE:
+        upstream = resolve_urban_vpn_proxy(vpn_country)
+        vpn_relay = AuthenticatedProxyRelay(upstream).start()
+        effective_proxy_str = vpn_relay.address
+        logging.info(
+            "[Urban VPN] Tuyến %s sẵn sàng qua relay cục bộ %s",
+            vpn_country, vpn_relay.address,
+        )
+
     profile_task_id = None if preserve_profile_data else task_id
     user_data_dir, launch_args = get_browser_launch_params(
-        email, chrome_profile, proxy_str, profile_task_id
+        email, chrome_profile, effective_proxy_str, profile_task_id
     )
     logging.info(
         "[Browser] Profile policy: preserve=%s; task_id=%s; profile_task_id=%s; user_data_dir=%s",
@@ -575,10 +932,10 @@ def launch_chrome_and_connect(
         "--enable-logging=stderr",
         "--log-level=1",
     ]
-    
+
     # Nếu dùng proxy, thêm tham số --proxy-server
-    if proxy_str:
-        proxy_settings = parse_proxy(proxy_str)
+    if effective_proxy_str:
+        proxy_settings = parse_proxy(effective_proxy_str)
         if proxy_settings and "server" in proxy_settings:
             chrome_args.append(f"--proxy-server={proxy_settings['server']}")
             
@@ -589,14 +946,10 @@ def launch_chrome_and_connect(
     chrome_args.append("--disable-blink-features=AutomationControlled")
     
     # Thêm cờ khởi chạy ở chế độ thu nhỏ (minimize) để tránh cản trở công việc người dùng
-    if hide_browser:
-        chrome_args.append("--start-minimized")
-        chrome_args.append("--window-position=-32000,-32000")
-        chrome_args.append("--window-size=1280,720")
-    elif tile_bounds is not None:
-        tile_x, tile_y, tile_width, tile_height = tile_bounds
-        chrome_args.append(f"--window-position={tile_x},{tile_y}")
-        chrome_args.append(f"--window-size={tile_width},{tile_height}")
+    effective_browser_mode = (
+        "headless" if headless_browser else "minimized" if hide_browser else "visible"
+    )
+    apply_browser_mode_args(chrome_args, effective_browser_mode, tile_bounds)
     
     # Khởi chạy Google Chrome
     startupinfo = None
@@ -671,7 +1024,7 @@ def launch_chrome_and_connect(
             args=(proc.pid, prev_active_hwnd),
             daemon=True
         ).start()
-    elif tile_bounds is not None:
+    elif not headless_browser and tile_bounds is not None:
         threading.Thread(
             target=_tile_chrome_window,
             args=(proc.pid, tile_bounds),
@@ -700,6 +1053,8 @@ def launch_chrome_and_connect(
         unregister_chrome_pid(proc.pid)
         runtime["monitor_stop"].set()
         chrome_log_stream.close()
+        if vpn_relay:
+            vpn_relay.close()
         raise Exception(f"Không thể khởi động cổng debug trên Chrome (Port: {port}).")
         
     # Kết nối Playwright tới cổng debug của Chrome
@@ -715,6 +1070,8 @@ def launch_chrome_and_connect(
         unregister_chrome_pid(proc.pid)
         runtime["monitor_stop"].set()
         chrome_log_stream.close()
+        if vpn_relay:
+            vpn_relay.close()
         raise Exception(f"Không thể kết nối Playwright tới Chrome qua CDP: {ex}")
 
     context._auto_flow_chrome_runtime = runtime
@@ -755,6 +1112,11 @@ def launch_chrome_and_connect(
             chrome_log_stream.close()
         except Exception:
             pass
+        if vpn_relay:
+            try:
+                vpn_relay.close()
+            except Exception as exc:
+                logging.warning("[Urban VPN] Không thể đóng relay: %s", exc)
         
         # Chỉ xóa profile theo-task của Flow Ảnh/Video. Gemini dùng profile bền vững,
         # phải giữ nguyên cookie, browser history và session sau khi đóng Chrome.

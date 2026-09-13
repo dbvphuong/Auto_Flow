@@ -1,13 +1,25 @@
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
                              QLabel, QLineEdit, QTableWidget, QTableWidgetItem, 
                              QHeaderView, QMessageBox, QGroupBox, QComboBox, 
-                             QCheckBox, QInputDialog, QDialog, QAbstractItemView)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+                             QCheckBox, QInputDialog, QAbstractItemView,
+                             QListWidget, QListWidgetItem, QListView, QSizePolicy)
+from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal
 import logging
 from data.database import SessionLocal
 from data.models import Account
 from core.browser_manager import login_and_save_cookies, get_local_chrome_profiles, get_browser_launch_params
-from core.system_config import load_system_config, save_system_config
+from core.system_config import (
+    CHROME_RUN_MODE_HEADLESS,
+    CHROME_RUN_MODE_MINIMIZED,
+    CHROME_RUN_MODE_VISIBLE,
+    get_chrome_run_mode,
+    load_system_config,
+    save_system_config,
+)
+from common.urban_vpn import (
+    DIRECT_CODE, FREE_URBAN_VPN_LOCATIONS, URBAN_VPN_LABELS,
+    normalize_vpn_order,
+)
 from datetime import datetime, timedelta, timezone
 
 class ReorderableTableWidget(QTableWidget):
@@ -42,79 +54,92 @@ class ReorderableTableWidget(QTableWidget):
                     return
         super().dropEvent(event)
 
-class ProxyDialog(QDialog):
-    def __init__(self, parent=None, current_proxy="", use_proxy=True):
+
+class VpnOrderListWidget(QListWidget):
+    """Three-column priority grid whose drag/drop operation swaps two entries."""
+
+    items_swapped = pyqtSignal()
+
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Cấu hình Proxy")
-        self.setMinimumWidth(350)
-        
-        layout = QVBoxLayout(self)
-        
-        self.combo_status = QComboBox()
-        self.combo_status.addItems(["ON (Sử dụng proxy)", "OFF (Sử dụng mạng máy)"])
-        self.combo_status.setCurrentIndex(0 if use_proxy else 1)
-        
-        layout.addWidget(QLabel("Trạng thái Proxy:"))
-        layout.addWidget(self.combo_status)
-        
-        self.line_proxy = QLineEdit()
-        self.line_proxy.setPlaceholderText("host:port hoặc host:port:user:pass")
-        self.line_proxy.setText(current_proxy)
-        
-        layout.addWidget(QLabel("Địa chỉ Proxy:"))
-        layout.addWidget(self.line_proxy)
-        
-        btn_layout = QHBoxLayout()
-        self.btn_save = QPushButton("Lưu")
-        self.btn_save.setStyleSheet("""
-            QPushButton {
-                background-color: #8b5cf6; 
-                color: white; 
-                font-weight: bold; 
-                padding: 6px 15px; 
-                border-radius: 4px;
-                border: none;
-            }
-            QPushButton:hover {
-                background-color: #a78bfa;
-            }
-        """)
-        self.btn_save.clicked.connect(self.accept)
-        
-        self.btn_cancel = QPushButton("Hủy")
-        self.btn_cancel.setStyleSheet("""
-            QPushButton {
-                background-color: transparent; 
-                border: 1px solid #4b5563; 
-                padding: 6px 15px; 
-                color: #d1d5db; 
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #374151;
-            }
-        """)
-        self.btn_cancel.clicked.connect(self.reject)
-        
-        btn_layout.addStretch()
-        btn_layout.addWidget(self.btn_save)
-        btn_layout.addWidget(self.btn_cancel)
-        layout.addLayout(btn_layout)
-        
-    def get_data(self):
-        use_proxy = (self.combo_status.currentIndex() == 0)
-        proxy_str = self.line_proxy.text().strip()
-        return use_proxy, proxy_str
+        self.setViewMode(QListView.ViewMode.IconMode)
+        self.setFlow(QListView.Flow.LeftToRight)
+        self.setWrapping(True)
+        self.setResizeMode(QListView.ResizeMode.Adjust)
+        self.setMovement(QListView.Movement.Snap)
+        # Keep the viewport width stable.  With an automatic vertical scrollbar,
+        # five items can alternate between a 3x2 and a 2x3 layout: one layout
+        # hides the scrollbar, the wider viewport then changes the column width,
+        # and that layout needs the scrollbar again.  Qt repeatedly relayouts and
+        # repaints the list, which looks like rapid flashing.
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setSpacing(2)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        available_width = max(540, self.viewport().width() - 6)
+        grid_size = QSize(available_width // 3, 32)
+        if self.gridSize() != grid_size:
+            self.setGridSize(grid_size)
+
+    def refresh_numbering(self):
+        for row in range(self.count()):
+            item = self.item(row)
+            code = item.data(Qt.ItemDataRole.UserRole)
+            label = (
+                URBAN_VPN_LABELS.get(code, str(code))
+                if code == DIRECT_CODE
+                else f"{URBAN_VPN_LABELS.get(code, str(code))} ({code})"
+            )
+            item.setText(f"{row + 1}.  {label}")
+            item.setTextAlignment(
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+            )
+
+    def swap_rows(self, source_row, target_row):
+        if (
+            source_row == target_row
+            or source_row < 0
+            or target_row < 0
+            or source_row >= self.count()
+            or target_row >= self.count()
+        ):
+            return False
+        source_item = self.item(source_row)
+        target_item = self.item(target_row)
+        source_code = source_item.data(Qt.ItemDataRole.UserRole)
+        target_code = target_item.data(Qt.ItemDataRole.UserRole)
+        source_item.setData(Qt.ItemDataRole.UserRole, target_code)
+        target_item.setData(Qt.ItemDataRole.UserRole, source_code)
+        self.refresh_numbering()
+        self.setCurrentRow(target_row)
+        self.items_swapped.emit()
+        return True
+
+    def dropEvent(self, event):
+        selected = self.selectedIndexes()
+        source_row = selected[0].row() if selected else -1
+        target_row = self.indexAt(event.position().toPoint()).row()
+        if self.swap_rows(source_row, target_row):
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
+        else:
+            event.ignore()
 
 class OpenBrowserWorker(QThread):
     browser_finished = pyqtSignal(int, str) # acc_id, cookies_json
     error = pyqtSignal(str)
 
-    def __init__(self, acc_id, email, proxy, cookies_json, chrome_profile="_tool_profile_"):
+    def __init__(self, acc_id, email, cookies_json, chrome_profile="_tool_profile_"):
         super().__init__()
         self.acc_id = acc_id
         self.email = email
-        self.proxy = proxy
         self.cookies_json = cookies_json
         self.chrome_profile = chrome_profile
 
@@ -126,7 +151,7 @@ class OpenBrowserWorker(QThread):
             from core.browser_manager import launch_chrome_and_connect
             
             with sync_playwright() as p:
-                context = launch_chrome_and_connect(p, self.email, self.chrome_profile, self.proxy)
+                context = launch_chrome_and_connect(p, self.email, self.chrome_profile)
                 
                 page = context.pages[0] if context.pages else context.new_page()
                 try:
@@ -165,15 +190,16 @@ class LoginWorker(QThread):
     # email, cookies_json, account_type, credits, chrome_profile
     error = pyqtSignal(str)
 
-    def __init__(self, proxy, email, chrome_profile="_tool_profile_"):
+    def __init__(self, email, chrome_profile="_tool_profile_"):
         super().__init__()
-        self.proxy = proxy
         self.email = email
         self.chrome_profile = chrome_profile
 
     def run(self):
         try:
-            cookies_json, account_type, credits = login_and_save_cookies(self.proxy, self.email, self.chrome_profile)
+            cookies_json, account_type, credits = login_and_save_cookies(
+                None, self.email, self.chrome_profile
+            )
             if cookies_json:
                 self.login_finished.emit(
                     self.email, cookies_json, account_type, credits, self.chrome_profile
@@ -202,10 +228,6 @@ class AccountsView(QWidget):
         self.email_input.setPlaceholderText("Nhập Email Google của bạn")
         add_layout.addWidget(self.email_input)
         
-        self.proxy_input = QLineEdit()
-        self.proxy_input.setPlaceholderText("Proxy (Tùy chọn) - host:port:user:pass")
-        add_layout.addWidget(self.proxy_input)
-
         add_layout.addWidget(QLabel("Profile:"))
         self.combo_login_profile = QComboBox()
         self.combo_login_profile.setMinimumWidth(220)
@@ -246,12 +268,19 @@ class AccountsView(QWidget):
         chrome_options_group = QGroupBox("Tuỳ chọn Chrome khi chạy tự động")
         chrome_options_layout = QHBoxLayout()
 
-        self.chk_show_chrome_when_running = QCheckBox("Hiện Chrome khi chạy ảnh/video")
-        self.chk_show_chrome_when_running.setToolTip(
-            "Bật để nhìn thấy Chrome khi tool chạy. Tắt để mở Chrome thu nhỏ và đưa ra ngoài màn hình."
+        chrome_options_layout.addWidget(QLabel("Chế độ Chrome khi chạy ảnh/video:"))
+        self.combo_chrome_run_mode = QComboBox()
+        self.combo_chrome_run_mode.addItem("Hiện Chrome", CHROME_RUN_MODE_VISIBLE)
+        self.combo_chrome_run_mode.addItem(
+            "Thu nhỏ và đưa ra ngoài màn hình", CHROME_RUN_MODE_MINIMIZED
         )
-        self.chk_show_chrome_when_running.stateChanged.connect(self.save_system_settings)
-        chrome_options_layout.addWidget(self.chk_show_chrome_when_running)
+        self.combo_chrome_run_mode.addItem("Ẩn hoàn toàn (Headless)", CHROME_RUN_MODE_HEADLESS)
+        self.combo_chrome_run_mode.setMinimumWidth(270)
+        self.combo_chrome_run_mode.setToolTip(
+            "Hiện Chrome; chạy có cửa sổ nhưng thu nhỏ; hoặc chạy headless hoàn toàn."
+        )
+        self.combo_chrome_run_mode.currentIndexChanged.connect(self.save_system_settings)
+        chrome_options_layout.addWidget(self.combo_chrome_run_mode)
         chrome_options_layout.addStretch()
 
         chrome_options_group.setLayout(chrome_options_layout)
@@ -293,12 +322,48 @@ class AccountsView(QWidget):
         
         tool_group.setLayout(tool_layout)
         layout.addWidget(tool_group)
+
+        vpn_group = QGroupBox("Thứ tự Urban VPN Proxy (chỉ tài khoản ULTRA)")
+        vpn_group.setObjectName("vpn_order_group")
+        vpn_group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        vpn_group.setMaximumHeight(160)
+        vpn_layout = QVBoxLayout(vpn_group)
+        vpn_layout.setContentsMargins(8, 8, 8, 8)
+        vpn_layout.setSpacing(5)
+
+        vpn_controls = QHBoxLayout()
+        vpn_controls.setSpacing(6)
+        vpn_controls.addWidget(QLabel("Thêm vị trí:"))
+        self.vpn_country_combo = QComboBox()
+        self.vpn_country_combo.setMinimumWidth(190)
+        for code, name in FREE_URBAN_VPN_LOCATIONS:
+            self.vpn_country_combo.addItem(f"{name} ({code})", code)
+        vpn_controls.addWidget(self.vpn_country_combo)
+        self.btn_add_vpn_country = QPushButton("Thêm")
+        self.btn_add_vpn_country.clicked.connect(self.add_vpn_country)
+        vpn_controls.addWidget(self.btn_add_vpn_country)
+        self.btn_remove_vpn_country = QPushButton("Bỏ mục đã chọn")
+        self.btn_remove_vpn_country.clicked.connect(self.remove_vpn_country)
+        vpn_controls.addWidget(self.btn_remove_vpn_country)
+        vpn_controls.addStretch()
+        vpn_controls.addWidget(QLabel("Kéo các dòng để đổi thứ tự ưu tiên"))
+        vpn_layout.addLayout(vpn_controls)
+
+        self.vpn_order_list = VpnOrderListWidget()
+        self.vpn_order_list.setFixedHeight(98)
+        self.vpn_order_list.items_swapped.connect(self.save_vpn_order)
+        self.vpn_order_list.setToolTip(
+            "Kéo để đổi thứ tự IP dùng ở lần đầu và các lần thử lại. "
+            "IP gốc luôn có trong danh sách."
+        )
+        vpn_layout.addWidget(self.vpn_order_list)
+        layout.addWidget(vpn_group)
         
         # Table panel
         self.table = ReorderableTableWidget(0, 10)
         self.table.row_moved_callback = self.on_row_moved
         self.table.setHorizontalHeaderLabels([
-            "ID", "Email", "Loại", "Ảnh", "Video", "Gemini", "Proxy",
+            "ID", "Email", "Loại", "Ảnh", "Video", "Gemini", "VPN",
             "Profile Chrome", "Trạng thái", "Hành động",
         ])
         
@@ -309,27 +374,100 @@ class AccountsView(QWidget):
         self.table.setColumnWidth(3, 50)   # Ảnh
         self.table.setColumnWidth(4, 50)   # Video
         self.table.setColumnWidth(5, 65)   # Gemini
-        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch) # Proxy (tự co giãn)
+        self.table.setColumnWidth(6, 55)   # VPN
         self.table.setColumnWidth(7, 180)  # Profile Chrome
         self.table.setColumnWidth(8, 140)  # Trạng thái (để hiển thị icon đẹp mắt)
-        self.table.setColumnWidth(9, 280)  # Hành động (Mở, Làm mới, Proxy, Xóa)
-        
+        self.table.setColumnWidth(9, 210)  # Hành động (Mở, Làm mới, Xóa)
+
+        bulk_toggle_layout = QHBoxLayout()
+        bulk_toggle_layout.setSpacing(6)
+        bulk_toggle_layout.addWidget(QLabel("Chọn nhanh:"))
+        for label, feature in (
+            ("Ảnh", "is_image"),
+            ("Video", "is_video"),
+            ("Gemini", "is_gemini"),
+            ("VPN", "use_vpn"),
+        ):
+            bulk_toggle_layout.addWidget(QLabel(f"{label}:"))
+            btn_select_all = QPushButton("Chọn tất cả")
+            btn_clear_all = QPushButton("Bỏ chọn tất cả")
+            btn_select_all.setToolTip(f"Bật {label} cho tất cả tài khoản")
+            btn_clear_all.setToolTip(f"Tắt {label} cho tất cả tài khoản")
+            btn_select_all.clicked.connect(
+                lambda _, key=feature: self.update_all_feature_toggles(key, True)
+            )
+            btn_clear_all.clicked.connect(
+                lambda _, key=feature: self.update_all_feature_toggles(key, False)
+            )
+            bulk_toggle_layout.addWidget(btn_select_all)
+            bulk_toggle_layout.addWidget(btn_clear_all)
+            if feature != "use_vpn":
+                bulk_toggle_layout.addSpacing(10)
+        bulk_toggle_layout.addStretch()
+        layout.addLayout(bulk_toggle_layout)
+
         layout.addWidget(self.table)
         self.load_system_settings()
 
     def load_system_settings(self):
         config = load_system_config()
-        self.chk_show_chrome_when_running.blockSignals(True)
-        self.chk_show_chrome_when_running.setChecked(config.get("show_chrome_when_running", False))
-        self.chk_show_chrome_when_running.blockSignals(False)
+        self.combo_chrome_run_mode.blockSignals(True)
+        mode_index = self.combo_chrome_run_mode.findData(get_chrome_run_mode(config))
+        self.combo_chrome_run_mode.setCurrentIndex(max(0, mode_index))
+        self.combo_chrome_run_mode.blockSignals(False)
+        self.set_vpn_order(config.get("urban_vpn_order"))
+
+    def set_vpn_order(self, order):
+        self.vpn_order_list.blockSignals(True)
+        self.vpn_order_list.clear()
+        for code in normalize_vpn_order(order):
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, code)
+            self.vpn_order_list.addItem(item)
+        self.vpn_order_list.refresh_numbering()
+        self.vpn_order_list.blockSignals(False)
+
+    def current_vpn_order(self):
+        return normalize_vpn_order([
+            self.vpn_order_list.item(row).data(Qt.ItemDataRole.UserRole)
+            for row in range(self.vpn_order_list.count())
+        ])
+
+    def save_vpn_order(self, *args):
+        save_system_config({"urban_vpn_order": self.current_vpn_order()})
+
+    def add_vpn_country(self):
+        code = self.vpn_country_combo.currentData()
+        if not code or code in self.current_vpn_order():
+            return
+        item = QListWidgetItem()
+        item.setData(Qt.ItemDataRole.UserRole, code)
+        self.vpn_order_list.addItem(item)
+        self.vpn_order_list.refresh_numbering()
+        self.save_vpn_order()
+
+    def remove_vpn_country(self):
+        row = self.vpn_order_list.currentRow()
+        if row < 0:
+            return
+        item = self.vpn_order_list.item(row)
+        if item.data(Qt.ItemDataRole.UserRole) == DIRECT_CODE:
+            QMessageBox.information(self, "IP gốc", "IP gốc luôn phải có trong danh sách.")
+            return
+        self.vpn_order_list.takeItem(row)
+        self.vpn_order_list.refresh_numbering()
+        self.save_vpn_order()
 
     def save_system_settings(self):
         try:
+            chrome_run_mode = self.combo_chrome_run_mode.currentData()
             save_system_config({
-                "show_chrome_when_running": self.chk_show_chrome_when_running.isChecked()
+                "chrome_run_mode": chrome_run_mode,
+                # Keep the legacy value for older builds that may read this config.
+                "show_chrome_when_running": chrome_run_mode == CHROME_RUN_MODE_VISIBLE,
             })
             logging.info(
-                f"[Settings] Show Chrome khi chạy tự động: {self.chk_show_chrome_when_running.isChecked()}"
+                "[Settings] Chế độ Chrome khi chạy tự động: %s", chrome_run_mode
             )
         except Exception as e:
             logging.warning(f"[Settings] Không thể lưu tuỳ chọn Chrome: {e}")
@@ -342,7 +480,7 @@ class AccountsView(QWidget):
         # Cập nhật selector_acc_combo
         current_selection_id = self.selector_acc_combo.currentData()
         self.selector_acc_combo.clear()
-        self.selector_acc_combo.addItem("Mặc định (Không dùng profile/Không proxy)", "_none_")
+        self.selector_acc_combo.addItem("Mặc định (không dùng profile)", "_none_")
         for acc in accounts:
             self.selector_acc_combo.addItem(f"ID {acc.id}: {acc.email}", acc.id)
             
@@ -401,14 +539,27 @@ class AccountsView(QWidget):
             )
             chk_gemini_layout.addWidget(chk_gemini)
             self.table.setCellWidget(i, 5, chk_gemini_container)
-            
-            proxy_str = acc.proxy or "Không có"
-            if acc.proxy:
-                prefix = "[ON] " if acc.use_proxy else "[OFF] "
-                display_proxy = f"{prefix}{proxy_str}"
-            else:
-                display_proxy = "Không có"
-            self.table.setItem(i, 6, QTableWidgetItem(display_proxy))
+
+            # Urban VPN is intentionally available only for ULTRA accounts.
+            chk_vpn_container = QWidget()
+            chk_vpn_layout = QHBoxLayout(chk_vpn_container)
+            chk_vpn_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            chk_vpn_layout.setContentsMargins(0, 0, 0, 0)
+            chk_vpn = QCheckBox()
+            is_ultra = "ULTRA" in (acc.account_type or "").upper()
+            chk_vpn.setEnabled(is_ultra)
+            chk_vpn.setChecked(bool(acc.use_vpn) and is_ultra)
+            chk_vpn.setToolTip(
+                "Dùng danh sách Urban VPN phía trên" if is_ultra
+                else "Urban VPN chỉ áp dụng cho tài khoản ULTRA"
+            )
+            chk_vpn.stateChanged.connect(
+                lambda state, a_id=acc.id: self.update_feature_toggle(
+                    a_id, "use_vpn", state == Qt.CheckState.Checked.value
+                )
+            )
+            chk_vpn_layout.addWidget(chk_vpn)
+            self.table.setCellWidget(i, 6, chk_vpn_container)
             
             # Profile Chrome (ComboBox)
             combo_profile = QComboBox()
@@ -449,7 +600,7 @@ class AccountsView(QWidget):
             status_item.setForeground(QBrush(QColor("#ffffff")))
             self.table.setItem(i, 8, status_item)
             
-            # Hành động (Làm mới, Proxy, Xóa)
+            # Hành động (Mở, Làm mới, Xóa)
             action_widget = QWidget()
             action_layout = QHBoxLayout(action_widget)
             action_layout.setContentsMargins(4, 2, 4, 2)
@@ -492,24 +643,6 @@ class AccountsView(QWidget):
             """)
             btn_refresh.clicked.connect(lambda _, a_id=acc.id: self.refresh_account(a_id))
             
-            btn_proxy = QPushButton("Proxy")
-            btn_proxy.setStyleSheet("""
-                QPushButton {
-                    background-color: #fd7e14; 
-                    color: white; 
-                    border-radius: 3px; 
-                    padding: 2px 8px;
-                    border: none;
-                }
-                QPushButton:hover {
-                    background-color: #e0690b;
-                }
-                QPushButton:pressed {
-                    background-color: #c95f08;
-                }
-            """)
-            btn_proxy.clicked.connect(lambda _, a_id=acc.id: self.edit_proxy(a_id))
-            
             btn_delete = QPushButton("Xóa")
             btn_delete.setStyleSheet("""
                 QPushButton {
@@ -530,7 +663,6 @@ class AccountsView(QWidget):
             
             action_layout.addWidget(btn_open)
             action_layout.addWidget(btn_refresh)
-            action_layout.addWidget(btn_proxy)
             action_layout.addWidget(btn_delete)
             self.table.setCellWidget(i, 9, action_widget)
         db.close()
@@ -542,16 +674,15 @@ class AccountsView(QWidget):
             QMessageBox.warning(self, "Lỗi", "Vui lòng nhập Email Google!")
             return
             
-        proxy = self.proxy_input.text().strip()
         chrome_profile = self.combo_login_profile.currentData() or "_tool_profile_"
         logging.info(
-            "[Account] Khởi động đăng nhập Chrome cho email=%s; proxy=%s; profile=%s",
-            email, proxy or "None", chrome_profile,
+            "[Account] Khởi động đăng nhập Chrome cho email=%s; profile=%s",
+            email, chrome_profile,
         )
         self.btn_login.setEnabled(False)
         self.btn_login.setText("Đang mở trình duyệt...")
         
-        self.worker = LoginWorker(proxy, email, chrome_profile)
+        self.worker = LoginWorker(email, chrome_profile)
         self.worker.login_finished.connect(self.on_login_finished)
         self.worker.error.connect(self.on_login_error)
         self.worker.start()
@@ -566,6 +697,8 @@ class AccountsView(QWidget):
             if acc:
                 acc.cookies_json = cookies_json
                 acc.account_type = account_type
+                if "ULTRA" not in (account_type or "").upper():
+                    acc.use_vpn = False
                 acc.credits = credits
                 acc.is_active = True
                 acc.chrome_profile = chrome_profile
@@ -578,7 +711,6 @@ class AccountsView(QWidget):
             position_val = db.query(Account).count()
             acc = Account(
                 email=email,
-                proxy=self.proxy_input.text().strip() or None,
                 cookies_json=cookies_json,
                 account_type=account_type,
                 credits=credits,
@@ -633,14 +765,13 @@ class AccountsView(QWidget):
             db.close()
             return
             
-        proxy = acc.proxy if acc.use_proxy else None
         cookies_json = acc.cookies_json
         chrome_profile = acc.chrome_profile or "_tool_profile_"
         db.close()
         
         logging.info(f"[Account] Khởi chạy Chrome xem trực tiếp cho ID: {acc_id} sử dụng profile {chrome_profile}")
         
-        worker = OpenBrowserWorker(acc_id, acc.email, proxy, cookies_json, chrome_profile)
+        worker = OpenBrowserWorker(acc_id, acc.email, cookies_json, chrome_profile)
         worker.browser_finished.connect(self.on_open_browser_finished)
         worker.error.connect(lambda err: QMessageBox.warning(self, "Lỗi", f"Lỗi trình duyệt: {err}"))
         self.open_workers[acc_id] = worker
@@ -687,33 +818,45 @@ class AccountsView(QWidget):
                 acc.is_video = is_checked
             elif feature == "is_gemini":
                 acc.is_gemini = is_checked
+            elif feature == "use_vpn":
+                is_ultra = "ULTRA" in (acc.account_type or "").upper()
+                acc.use_vpn = bool(is_checked and is_ultra)
             db.commit()
         db.close()
 
-    def edit_proxy(self, acc_id):
-        db = SessionLocal()
-        acc = db.query(Account).filter(Account.id == acc_id).first()
-        if not acc:
-            db.close()
+    def update_all_feature_toggles(self, feature, is_checked):
+        feature_columns = {
+            "is_image": 3,
+            "is_video": 4,
+            "is_gemini": 5,
+            "use_vpn": 6,
+        }
+        if feature not in feature_columns:
+            logging.warning(f"[Account] Từ chối cập nhật hàng loạt feature không hợp lệ: {feature}")
             return
-            
-        current_proxy = acc.proxy or ""
-        use_proxy = acc.use_proxy
-        db.close()
-        
-        dialog = ProxyDialog(self, current_proxy, use_proxy)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            new_use_proxy, new_proxy_str = dialog.get_data()
-            
-            db = SessionLocal()
-            acc = db.query(Account).filter(Account.id == acc_id).first()
-            if acc:
-                logging.info(f"[Account] Cập nhật Proxy tài khoản ID {acc_id}: Trạng thái={new_use_proxy}, String='{new_proxy_str}'")
-                acc.proxy = new_proxy_str or None
-                acc.use_proxy = new_use_proxy
-                db.commit()
+
+        logging.info(
+            f"[Account] Cập nhật {feature}={is_checked} cho tất cả tài khoản."
+        )
+        db = SessionLocal()
+        try:
+            query = db.query(Account)
+            if feature == "use_vpn" and is_checked:
+                query = query.filter(Account.account_type.ilike("%ULTRA%"))
+            query.update({getattr(Account, feature): is_checked}, synchronize_session=False)
+            db.commit()
+        finally:
             db.close()
-            self.load_accounts()
+
+        column = feature_columns[feature]
+        for row in range(self.table.rowCount()):
+            container = self.table.cellWidget(row, column)
+            checkbox = container.findChild(QCheckBox) if container else None
+            if checkbox is None:
+                continue
+            checkbox.blockSignals(True)
+            checkbox.setChecked(bool(is_checked and checkbox.isEnabled()))
+            checkbox.blockSignals(False)
 
     def refresh_account(self, acc_id):
         db = SessionLocal()
@@ -722,7 +865,6 @@ class AccountsView(QWidget):
             db.close()
             return
             
-        proxy = acc.proxy if acc.use_proxy else None
         email = acc.email
         chrome_profile = acc.chrome_profile or "_tool_profile_"
         db.close()
@@ -732,7 +874,7 @@ class AccountsView(QWidget):
         self.btn_login.setEnabled(False)
         self.btn_login.setText("Đang làm mới cookie...")
         
-        self.worker = LoginWorker(proxy, email, chrome_profile)
+        self.worker = LoginWorker(email, chrome_profile)
         self.worker.login_finished.connect(self.on_login_finished)
         self.worker.error.connect(self.on_login_error)
         self.worker.start()
@@ -743,8 +885,6 @@ class AccountsView(QWidget):
         
         email = ""
         chrome_profile = "_tool_profile_"
-        proxy = ""
-        
         if acc_val and acc_val != "_none_":
             acc_id = acc_val
             db = SessionLocal()
@@ -752,8 +892,6 @@ class AccountsView(QWidget):
             if acc:
                 email = acc.email or ""
                 chrome_profile = acc.chrome_profile or "_tool_profile_"
-                if acc.proxy and acc.use_proxy:
-                    proxy = acc.proxy
             db.close()
             
         import subprocess
@@ -764,8 +902,6 @@ class AccountsView(QWidget):
         script_path = os.path.join(BASE_DIR, "src", "core", "open_inspector.py")
         
         cmd = [sys.executable, script_path, "--email", email, "--profile", chrome_profile, "--url", url]
-        if proxy:
-            cmd.extend(["--proxy", proxy])
             
         logging.info(f"[SelectorTool] Chạy lệnh: {' '.join(cmd)}")
         

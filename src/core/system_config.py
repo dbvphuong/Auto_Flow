@@ -2,8 +2,21 @@ import json
 import os
 
 
+CHROME_RUN_MODE_VISIBLE = "visible"
+CHROME_RUN_MODE_MINIMIZED = "minimized"
+CHROME_RUN_MODE_HEADLESS = "headless"
+CHROME_RUN_MODES = {
+    CHROME_RUN_MODE_VISIBLE,
+    CHROME_RUN_MODE_MINIMIZED,
+    CHROME_RUN_MODE_HEADLESS,
+}
+
+
 DEFAULT_SYSTEM_CONFIG = {
     "show_chrome_when_running": False,
+    "chrome_run_mode": CHROME_RUN_MODE_MINIMIZED,
+    "urban_vpn_order": ["DIRECT", "DE", "US", "GB"],
+    "theme": "dark",
 }
 
 
@@ -26,9 +39,27 @@ def load_system_config():
             saved = json.load(f)
         if isinstance(saved, dict):
             config.update(saved)
+            # Backward compatibility with the former two-state checkbox.
+            if "chrome_run_mode" not in saved:
+                config["chrome_run_mode"] = (
+                    CHROME_RUN_MODE_VISIBLE
+                    if bool(saved.get("show_chrome_when_running", False))
+                    else CHROME_RUN_MODE_MINIMIZED
+                )
     except Exception:
         pass
     return config
+
+
+def get_chrome_run_mode(config=None):
+    """Return a supported Chrome mode, including migration from the old checkbox."""
+    values = load_system_config() if config is None else config
+    mode = values.get("chrome_run_mode") if isinstance(values, dict) else None
+    if mode in CHROME_RUN_MODES:
+        return mode
+    if isinstance(values, dict) and bool(values.get("show_chrome_when_running", False)):
+        return CHROME_RUN_MODE_VISIBLE
+    return CHROME_RUN_MODE_MINIMIZED
 
 
 def save_system_config(config):

@@ -1,5 +1,4 @@
 @echo off
-title Auto Flow Launcher
-echo Starting Auto_Flow...
-python src\main.py
-pause
+cd /d "%~dp0"
+start "" pythonw.exe "%~dp0src\main.py"
+exit /b 0

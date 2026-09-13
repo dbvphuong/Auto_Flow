@@ -72,6 +72,7 @@ Dưới đây là danh sách các đầu việc. Trạng thái các task đượ
 - [x] **DONE**: Tích hợp kịch bản Playwright tự động hóa tạo video trên Google Labs Flow.
 
 ### 6. Giao diện & Xử lý - Tab "Gemini"
+- [x] **VERIFY**: Tách một file TXT thành các file con 1.txt, 2.txt... trong folder full; mỗi file chỉ có một dòng, theo giới hạn từ và ưu tiên ranh giới câu.
 - [x] **VERIFY**: Tab Gemini nằm giữa Flow Video và Cài đặt hệ thống, đồng bộ màu sắc/layout hiện tại.
 - [x] **VERIFY**: Master Prompt và cốt truyện hỗ trợ nhập text hoặc nạp từ một file; bỏ tính năng thêm batch thủ công.
 - [x] **VERIFY**: Chọn nhiều quốc gia bằng checkbox và tạo một batch/file TXT tương ứng cho mỗi quốc gia.

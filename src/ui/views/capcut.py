@@ -28,6 +28,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from common.logger import activity, progress as log_progress
+
 from core.capcut_tools import (
     apply_perfect_motion,
     build_basic_timeline,
@@ -45,7 +47,13 @@ from core.capcut_tools import (
     sorted_files,
     validate_fps,
     validate_quality,
+    prepare_timeline_clip_jobs,
     prepare_timeline_video_jobs,
+    prepare_video_audio_batch_jobs,
+    merge_videos,
+    natural_key,
+    render_video_audio_batch_job,
+    replace_video_intro,
 )
 from core.system_config import load_system_config, save_system_config
 
@@ -108,6 +116,30 @@ class CapcutWorker(QThread):
                 self._run_batch()
             elif self.operation == "srt_video":
                 self._run_srt_video()
+            elif self.operation == "merge_videos":
+                self.progress.emit("Đang kiểm tra và ghép video...", 0, len(self.options["videos"]) + 1)
+                output, encoder = merge_videos(
+                    self.options["videos"], self.options["output"],
+                    self._join_progress, lambda: self._cancelled,
+                )
+                self.completed.emit({
+                    "operation": "merge_videos", "output": str(output),
+                    "encoder": encoder, "clips": len(self.options["videos"]),
+                })
+            elif self.operation == "replace_intro":
+                self.progress.emit("Đang kiểm tra và ghi đè đoạn đầu...", 0, len(self.options["videos"]) + 1)
+                output, encoder = replace_video_intro(
+                    self.options["source"], self.options["videos"], self.options["output"],
+                    self._join_progress, lambda: self._cancelled,
+                    overlay_volume=self.options["overlay_volume"],
+                )
+                self.completed.emit({
+                    "operation": "replace_intro", "output": str(output),
+                    "encoder": encoder, "clips": len(self.options["videos"]),
+                    "overlay_volume": self.options["overlay_volume"],
+                })
+            elif self.operation == "video_audio_batch":
+                self._run_video_audio_batch()
         except InterruptedError as exc:
             self.completed.emit({"operation": self.operation, "stopped": True, "message": str(exc)})
         except Exception as exc:
@@ -115,6 +147,10 @@ class CapcutWorker(QThread):
 
     def _render_progress(self, current, total):
         self.progress.emit(f"Đang render đoạn {current}/{total}", current, total)
+
+    def _join_progress(self, current, total):
+        text = "Đang mã hóa video..." if current >= total - 1 else f"Đang kiểm tra file {current}/{total - 1}"
+        self.progress.emit(text, current, total)
 
     def _run_batch(self):
         jobs, skipped = scan_batch_folders(self.options["root"])
@@ -162,6 +198,63 @@ class CapcutWorker(QThread):
             "encoder": encoder_label, "fps": self.options["fps"],
         })
 
+    def _run_video_audio_batch(self):
+        jobs = self.options["jobs"]
+        skipped = list(self.options["skipped"])
+        success, errors, encoder_label = [], [], None
+        for offset, job in enumerate(jobs):
+            index = offset + 1
+            if self._cancelled:
+                self.completed.emit({
+                    "operation": "video_audio_batch", "success": success,
+                    "skipped": skipped, "errors": errors, "stopped": True,
+                    "encoder": encoder_label,
+                    "video_volume": self.options["video_volume"],
+                    "quality": self.options["quality"],
+                })
+                return
+            self.progress.emit(
+                f"Đang tạo video {index}/{len(jobs)}: {job.audio_path.name}",
+                index - 1, len(jobs),
+            )
+            started_at = time.perf_counter()
+            try:
+                def job_progress(current, total):
+                    phase = (
+                        "Đang ghép video và MP3"
+                        if current >= total else
+                        f"Đang chuẩn hóa clip {current}/{total - 1}"
+                    )
+                    self.progress.emit(
+                        f"{phase} — MP3 {index}/{len(jobs)}: {job.audio_path.name}",
+                        current, total,
+                    )
+
+                output, encoder_label = render_video_audio_batch_job(
+                    job, self.options["video_volume"], self.options["quality"],
+                    progress=job_progress,
+                    cancelled=lambda: self._cancelled,
+                )
+                success.append((job.audio_path.name, str(output), time.perf_counter() - started_at))
+            except InterruptedError:
+                self.completed.emit({
+                    "operation": "video_audio_batch", "success": success,
+                    "skipped": skipped, "errors": errors, "stopped": True,
+                    "encoder": encoder_label,
+                    "video_volume": self.options["video_volume"],
+                    "quality": self.options["quality"],
+                })
+                return
+            except Exception as exc:
+                errors.append((job.audio_path.name, str(exc)))
+            self.progress.emit(f"Đã xử lý {index}/{len(jobs)} video", index, len(jobs))
+        self.completed.emit({
+            "operation": "video_audio_batch", "success": success,
+            "skipped": skipped, "errors": errors, "encoder": encoder_label,
+            "video_volume": self.options["video_volume"],
+            "quality": self.options["quality"],
+        })
+
     def _run_srt_video(self):
         jobs = self.options["jobs"]
         records = list(self.options["skipped"])
@@ -195,8 +288,10 @@ class CapcutWorker(QThread):
                 clear_project(self.options["project"], unique_backup=True)
                 json_path = Path(self.options["project"]) / "draft_content.json"
                 build_timeline_video_project(json_path, job)
-                apply_perfect_motion(json_path, *self.options["zoom"])
-                motions = generated_motion(json_path)
+                motions = None
+                if job.media_type == "image":
+                    apply_perfect_motion(json_path, *self.options["zoom"])
+                    motions = generated_motion(json_path)
                 output, encoder_label = render_timeline_video(
                     job, self.options["quality"], self.options["fps"], self.options["zoom"],
                     cancelled=lambda: self._cancelled,
@@ -257,10 +352,53 @@ class PathRow(QWidget):
         self.button.setEnabled(enabled)
 
 
+class FilePathRow(QWidget):
+    changed = pyqtSignal(str)
+
+    def __init__(self, placeholder, title, save=False):
+        super().__init__()
+        self.title = title
+        self.save = save
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.edit = QLineEdit()
+        self.edit.setPlaceholderText(placeholder)
+        self.button = QPushButton("💾 Chọn output" if save else "📄 Chọn video")
+        layout.addWidget(self.edit, 1)
+        layout.addWidget(self.button)
+        self.button.clicked.connect(self._browse)
+        self.edit.textChanged.connect(self.changed)
+
+    def _browse(self):
+        if self.save:
+            path, _ = QFileDialog.getSaveFileName(
+                self, self.title, self.edit.text().strip(), "Video MP4 (*.mp4)"
+            )
+            if path and not path.lower().endswith(".mp4"):
+                path += ".mp4"
+        else:
+            path, _ = QFileDialog.getOpenFileName(
+                self, self.title, self.edit.text().strip(), "Video MP4 (*.mp4)"
+            )
+        if path:
+            self.edit.setText(path)
+
+    def text(self):
+        return self.edit.text().strip()
+
+    def setText(self, text):
+        self.edit.setText(str(text or ""))
+
+    def setEnabled(self, enabled):
+        super().setEnabled(enabled)
+        self.edit.setEnabled(enabled)
+        self.button.setEnabled(enabled)
+
+
 class MultiFilePicker(QWidget):
     changed = pyqtSignal()
 
-    def __init__(self, title, file_filter, suffixes, allow_folder=False):
+    def __init__(self, title, file_filter, suffixes, allow_folder=False, allow_reorder=False):
         super().__init__()
         self.title = title
         self.file_filter = file_filter
@@ -284,6 +422,13 @@ class MultiFilePicker(QWidget):
         remove.clicked.connect(self._remove_selected)
         clear = QPushButton("Xóa danh sách")
         clear.clicked.connect(self.list.clear)
+        if allow_reorder:
+            move_up = QPushButton("↑ Lên")
+            move_down = QPushButton("↓ Xuống")
+            move_up.clicked.connect(lambda: self._move_selected(-1))
+            move_down.clicked.connect(lambda: self._move_selected(1))
+            buttons.addWidget(move_up)
+            buttons.addWidget(move_down)
         buttons.addWidget(remove)
         buttons.addWidget(clear)
         buttons.addStretch()
@@ -298,7 +443,7 @@ class MultiFilePicker(QWidget):
         if folder:
             paths = sorted(
                 (path for path in Path(folder).rglob("*") if path.is_file() and path.suffix.lower() in self.suffixes),
-                key=lambda path: str(path).lower(),
+                key=lambda path: natural_key(str(path)),
             )
             self.add_paths(paths)
 
@@ -313,6 +458,16 @@ class MultiFilePicker(QWidget):
     def _remove_selected(self):
         for item in self.list.selectedItems():
             self.list.takeItem(self.list.row(item))
+
+    def _move_selected(self, offset):
+        row = self.list.currentRow()
+        target = row + offset
+        if row < 0 or target < 0 or target >= self.list.count():
+            return
+        item = self.list.takeItem(row)
+        self.list.insertItem(target, item)
+        self.list.setCurrentRow(target)
+        self.changed.emit()
 
     def paths(self):
         return [self.list.item(row).text() for row in range(self.list.count())]
@@ -397,7 +552,8 @@ class CapcutView(QWidget):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._single_tab(), "🎞 Một dự án")
         self.tabs.addTab(self._batch_tab(), "📚 Hàng loạt")
-        self.tabs.addTab(self._srt_video_tab(), "Tạo Video Ảnh Srt")
+        self.tabs.addTab(self._srt_video_tab(), "Tạo Video Timeline")
+        self.tabs.addTab(self._join_video_tab(), "Ghép Video → Video")
         root.addWidget(self.tabs, 1)
 
         status_frame = QFrame()
@@ -556,17 +712,22 @@ class CapcutView(QWidget):
         inputs = QGroupBox("Dữ liệu đầu vào — chọn nhiều timeline và nhiều MP3")
         form = QFormLayout(inputs)
         project_row, self.srt_project = self._project_row()
+        self.srt_media_mode = QComboBox()
+        self.srt_media_mode.addItem("Ảnh", "image")
+        self.srt_media_mode.addItem("Video", "video")
         self.srt_timelines = MultiFilePicker(
             "Chọn timeline JSON hoặc folder JSON", "Timeline JSON (*.json)", (".json",), allow_folder=True
         )
-        self.srt_images = PathRow("Folder gốc chứa các folder ảnh con")
+        self.srt_media_folder = PathRow("Folder gốc chứa các folder ảnh con")
         self.srt_audios = MultiFilePicker(
             "Chọn MP3 hoặc folder MP3", "Audio MP3 (*.mp3)", (".mp3",), allow_folder=True
         )
         self.srt_output = PathRow("Để trống: xuất cạnh từng file MP3")
         form.addRow("Dự án CapCut:", project_row)
+        form.addRow("Nguồn hình:", self.srt_media_mode)
         form.addRow("Timeline JSON:", self.srt_timelines)
-        form.addRow("Folder gốc ảnh:", self.srt_images)
+        self.srt_media_label = QLabel("Folder gốc ảnh:")
+        form.addRow(self.srt_media_label, self.srt_media_folder)
         form.addRow("File/Folder MP3:", self.srt_audios)
         form.addRow("Folder output:", self.srt_output)
         layout.addWidget(inputs)
@@ -589,19 +750,17 @@ class CapcutView(QWidget):
         quality_layout.addWidget(QLabel("FPS"))
         quality_layout.addWidget(self.srt_fps)
         quality_layout.addStretch()
-        settings_form.addRow("Zoom / Pan:", self.srt_zoom)
+        self.srt_zoom_label = QLabel("Zoom / Pan:")
+        settings_form.addRow(self.srt_zoom_label, self.srt_zoom)
         settings_form.addRow("Xuất video:", quality_fps)
-        settings_form.addRow("Kiểu zoom:", self.srt_smooth_zoom)
+        self.srt_smooth_label = QLabel("Kiểu zoom:")
+        settings_form.addRow(self.srt_smooth_label, self.srt_smooth_zoom)
         layout.addWidget(settings)
 
-        note = QLabel(
-            "JSON và MP3 phải cùng toàn bộ tên file, chỉ khác đuôi .json/.mp3. "
-            "Folder ảnh con được ghép bằng phần tên trước dấu “_”. "
-            "Trong folder ảnh, tên 002_* sẽ khớp với scene 2; ảnh _2K được ưu tiên."
-        )
-        note.setWordWrap(True)
-        note.setStyleSheet("color:#a6adc8;padding:5px;")
-        layout.addWidget(note)
+        self.srt_note = QLabel()
+        self.srt_note.setWordWrap(True)
+        self.srt_note.setStyleSheet("color:#a6adc8;padding:5px;")
+        layout.addWidget(self.srt_note)
         actions = QHBoxLayout()
         self.btn_srt_run = QPushButton("▶ KIỂM TRA VÀ CHẠY")
         self.btn_srt_run.setStyleSheet(self._primary("#16a34a"))
@@ -614,13 +773,151 @@ class CapcutView(QWidget):
         layout.addLayout(actions)
         layout.addStretch()
         self._controls.extend((
-            self.srt_project, self.srt_timelines, self.srt_images, self.srt_audios, self.srt_output,
+            self.srt_project, self.srt_media_mode, self.srt_timelines, self.srt_media_folder,
+            self.srt_audios, self.srt_output,
             self.srt_zoom, self.srt_quality, self.srt_fps, self.btn_srt_run,
             self.srt_smooth_zoom,
         ))
+        self.srt_media_mode.currentIndexChanged.connect(self._update_srt_media_mode)
         self.btn_srt_run.clicked.connect(self.start_srt_video)
         self.btn_srt_stop.clicked.connect(self.stop_processing)
+        self._update_srt_media_mode()
         return tab
+
+    def _join_video_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        simple = QGroupBox("1. Ghép nhiều video thành một video")
+        simple_form = QFormLayout(simple)
+        self.join_videos = MultiFilePicker(
+            "Chọn các video theo thứ tự ghép", "Video MP4 (*.mp4)", (".mp4",),
+            allow_folder=True, allow_reorder=True,
+        )
+        self.join_output = FilePathRow(
+            "Đường dẫn video MP4 sau khi ghép", "Chọn file video sau khi ghép", save=True
+        )
+        self.btn_join_run = QPushButton("🔗 GHÉP VIDEO")
+        self.btn_join_run.setStyleSheet(self._primary("#16a34a"))
+        simple_form.addRow("Video con:", self.join_videos)
+        simple_form.addRow("File output:", self.join_output)
+        simple_form.addRow("", self.btn_join_run)
+        layout.addWidget(simple)
+
+        replace = QGroupBox("2. Ghi đè chuỗi video lên đoạn đầu video nguồn")
+        replace_form = QFormLayout(replace)
+        self.replace_source = FilePathRow(
+            "Video nguồn dài (.mp4)", "Chọn video nguồn", save=False
+        )
+        self.replace_videos = MultiFilePicker(
+            "Chọn các video ghi đè theo thứ tự", "Video MP4 (*.mp4)", (".mp4",),
+            allow_folder=True, allow_reorder=True,
+        )
+        self.replace_output = FilePathRow(
+            "Đường dẫn video MP4 kết quả", "Chọn file video kết quả", save=True
+        )
+        self.replace_overlay_volume = QDoubleSpinBox()
+        self.replace_overlay_volume.setRange(0, 100)
+        self.replace_overlay_volume.setDecimals(0)
+        self.replace_overlay_volume.setSingleStep(5)
+        self.replace_overlay_volume.setSuffix(" %")
+        self.replace_overlay_volume.setValue(100)
+        self.replace_overlay_volume.setToolTip(
+            "Âm lượng của các video ghi đè. Audio video nguồn luôn giữ nguyên 100%."
+        )
+        self.btn_replace_run = QPushButton("🎬 GHÉP VÀO ĐẦU VIDEO NGUỒN")
+        self.btn_replace_run.setStyleSheet(self._primary("#7c3aed"))
+        replace_form.addRow("Video nguồn:", self.replace_source)
+        replace_form.addRow("Video ghi đè:", self.replace_videos)
+        replace_form.addRow("Âm lượng video ghi đè:", self.replace_overlay_volume)
+        replace_form.addRow("File output:", self.replace_output)
+        replace_form.addRow("", self.btn_replace_run)
+        layout.addWidget(replace)
+
+        batch_audio = QGroupBox("3. Tạo MP4 hàng loạt từ MP3 và các folder video")
+        batch_audio_form = QFormLayout(batch_audio)
+        self.batch_join_audios = MultiFilePicker(
+            "Chọn các MP3 cần tạo video", "Audio MP3 (*.mp3)", (".mp3",),
+            allow_folder=True,
+        )
+        self.batch_join_video_root = PathRow("Folder gốc chứa các folder video cùng tên MP3")
+        self.batch_join_volume = QDoubleSpinBox()
+        self.batch_join_volume.setRange(0, 100)
+        self.batch_join_volume.setDecimals(0)
+        self.batch_join_volume.setSingleStep(5)
+        self.batch_join_volume.setSuffix(" %")
+        self.batch_join_volume.setValue(0)
+        self.batch_join_volume.setToolTip(
+            "Âm lượng của video con. MP3 luôn được giữ ở mức 100%."
+        )
+        self.batch_join_quality = QComboBox()
+        self.batch_join_quality.addItems(("720P", "1080P", "2K", "4K"))
+        self.batch_join_quality.setCurrentText("1080P")
+        self.btn_batch_join_run = QPushButton("🎞 TẠO VIDEO HÀNG LOẠT")
+        self.btn_batch_join_run.setStyleSheet(self._primary("#0891b2"))
+        batch_audio_form.addRow("Các file MP3:", self.batch_join_audios)
+        batch_audio_form.addRow("Folder video gốc:", self.batch_join_video_root)
+        batch_audio_form.addRow("Độ phân giải xuất:", self.batch_join_quality)
+        batch_audio_form.addRow("Âm lượng video:", self.batch_join_volume)
+        batch_audio_form.addRow("", self.btn_batch_join_run)
+        layout.addWidget(batch_audio)
+
+        note = QLabel(
+            "Thứ tự trong danh sách là thứ tự xuất hiện trong video. Ở chế độ 2, phần hình "
+            "của các video nhỏ thay phần đầu video nguồn; âm thanh video nguồn luôn giữ nguyên 100%. "
+            "Âm thanh video ghi đè được trộn theo mức đã chọn (0% = chỉ thay hình). Tổng thời lượng "
+            "video nguồn được giữ nguyên. Video khác kích thước/FPS sẽ tự căn vừa và thêm viền đen nếu cần.\n"
+            "Ở chế độ 3, tên folder video được bỏ hậu tố sao chép dạng (1), rồi phải trùng toàn bộ tên MP3 "
+            "không gồm .mp3. Vòng video đầu giữ đúng thứ tự tên; các vòng sau được xáo trộn. MP4 được tạo "
+            "cạnh MP3, cùng tên, và tự bỏ qua nếu đã tồn tại."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#a6adc8;padding:5px;")
+        layout.addWidget(note)
+        self.btn_join_stop = QPushButton("■ DỪNG")
+        self.btn_join_stop.setStyleSheet(self._primary("#dc2626"))
+        self.btn_join_stop.setEnabled(False)
+        stop_row = QHBoxLayout()
+        stop_row.addWidget(self.btn_join_stop)
+        stop_row.addStretch()
+        layout.addLayout(stop_row)
+        layout.addStretch()
+
+        self._controls.extend((
+            self.join_videos, self.join_output, self.btn_join_run,
+            self.replace_source, self.replace_videos, self.replace_overlay_volume,
+            self.replace_output, self.btn_replace_run,
+            self.batch_join_audios, self.batch_join_video_root,
+            self.batch_join_quality, self.batch_join_volume, self.btn_batch_join_run,
+        ))
+        self.btn_join_run.clicked.connect(self.start_merge_videos)
+        self.btn_replace_run.clicked.connect(self.start_replace_intro)
+        self.btn_batch_join_run.clicked.connect(self.start_video_audio_batch)
+        self.btn_join_stop.clicked.connect(self.stop_processing)
+        return tab
+
+    def _srt_media_type(self):
+        return self.srt_media_mode.currentData() or "image"
+
+    def _update_srt_media_mode(self, *args):
+        is_video = self._srt_media_type() == "video"
+        self.srt_media_label.setText("Folder video:" if is_video else "Folder gốc ảnh:")
+        self.srt_media_folder.edit.setPlaceholderText(
+            "Folder chứa trực tiếp các clip đánh số scene" if is_video
+            else "Folder gốc chứa các folder ảnh con"
+        )
+        self.srt_zoom_label.setVisible(not is_video)
+        self.srt_zoom.setVisible(not is_video)
+        self.srt_smooth_label.setVisible(not is_video)
+        self.srt_smooth_zoom.setVisible(not is_video)
+        common = "JSON và MP3 phải cùng toàn bộ tên file, chỉ khác đuôi .json/.mp3. "
+        self.srt_note.setText(common + (
+            "Video nằm trực tiếp trong folder đã chọn; tên 002_720p.mp4 sẽ khớp scene 2. "
+            "Clip ngắn được lặp, clip dài được cắt; chế độ này không dùng Zoom/Pan."
+            if is_video else
+            "Folder ảnh con được ghép bằng phần tên trước dấu “_”. "
+            "Trong folder ảnh, tên 002_* sẽ khớp scene 2; ảnh _2K được ưu tiên."
+        ))
 
     def refresh_projects(self):
         selected_single = self.single_project.currentText() if hasattr(self, "single_project") else ""
@@ -677,14 +974,39 @@ class CapcutView(QWidget):
         srt = settings.get("srt_video", {})
         if isinstance(srt, dict):
             self._restore_combo(self.srt_project, srt.get("project"))
+            media_type = srt.get("media_type", "image")
+            mode_index = self.srt_media_mode.findData(media_type)
+            if mode_index >= 0:
+                self.srt_media_mode.setCurrentIndex(mode_index)
             self.srt_timelines.add_paths(srt.get("timelines", []))
-            self.srt_images.setText(srt.get("images", ""))
+            self.srt_media_folder.setText(srt.get("media_folder", srt.get("images", "")))
             self.srt_audios.add_paths(srt.get("audios", []))
             self.srt_output.setText(srt.get("output", ""))
             self.srt_zoom.set_values(srt.get("zoom"))
             self._restore_combo(self.srt_quality, srt.get("quality"))
             self._restore_combo(self.srt_fps, srt.get("fps"))
             self.srt_smooth_zoom.setChecked(bool(srt.get("smooth_zoom", False)))
+
+        join = settings.get("join_video", {})
+        if isinstance(join, dict):
+            self.join_videos.add_paths(join.get("videos", []))
+            self.join_output.setText(join.get("output", ""))
+            self.replace_source.setText(join.get("source", ""))
+            self.replace_videos.add_paths(join.get("replace_videos", []))
+            self.replace_output.setText(join.get("replace_output", ""))
+            try:
+                self.replace_overlay_volume.setValue(float(join.get("overlay_volume", 100)))
+            except (TypeError, ValueError):
+                self.replace_overlay_volume.setValue(100)
+            self.batch_join_audios.add_paths(join.get("batch_audios", []))
+            self.batch_join_video_root.setText(join.get("batch_video_root", ""))
+            try:
+                self.batch_join_volume.setValue(float(join.get("batch_video_volume", 0)))
+            except (TypeError, ValueError):
+                self.batch_join_volume.setValue(0)
+            self._restore_combo(
+                self.batch_join_quality, join.get("batch_quality", "1080P")
+            )
 
         try:
             tab_index = int(settings.get("tab", 0))
@@ -698,13 +1020,20 @@ class CapcutView(QWidget):
         self.tabs.currentChanged.connect(self._save_settings)
         for path_row in (
             self.single_audio, self.single_images, self.single_output,
-            self.batch_root, self.srt_images, self.srt_output,
+            self.batch_root, self.srt_media_folder, self.srt_output,
+            self.join_output, self.replace_source, self.replace_output,
+            self.batch_join_video_root,
         ):
             path_row.changed.connect(self._save_settings)
-        for picker in (self.srt_timelines, self.srt_audios):
+        for picker in (
+            self.srt_timelines, self.srt_audios, self.join_videos, self.replace_videos,
+            self.batch_join_audios,
+        ):
             picker.changed.connect(self._save_settings)
         for zoom in (self.single_zoom, self.batch_zoom, self.srt_zoom):
             zoom.changed.connect(self._save_settings)
+        self.replace_overlay_volume.valueChanged.connect(self._save_settings)
+        self.batch_join_volume.valueChanged.connect(self._save_settings)
         for checkbox in (
             self.single_smooth_zoom, self.batch_smooth_zoom, self.srt_smooth_zoom,
         ):
@@ -712,7 +1041,8 @@ class CapcutView(QWidget):
         for combo in (
             self.single_project, self.single_quality, self.single_fps,
             self.batch_project, self.batch_quality, self.batch_fps,
-            self.srt_project, self.srt_quality, self.srt_fps,
+            self.srt_project, self.srt_media_mode, self.srt_quality, self.srt_fps,
+            self.batch_join_quality,
         ):
             combo.currentIndexChanged.connect(self._save_settings)
 
@@ -745,14 +1075,27 @@ class CapcutView(QWidget):
                     },
                     "srt_video": {
                         "project": self.srt_project.currentText(),
+                        "media_type": self._srt_media_type(),
                         "timelines": self.srt_timelines.paths(),
-                        "images": self.srt_images.text(),
+                        "media_folder": self.srt_media_folder.text(),
                         "audios": self.srt_audios.paths(),
                         "output": self.srt_output.text(),
                         "zoom": self._zoom_state(self.srt_zoom),
                         "quality": self.srt_quality.currentText(),
                         "fps": self.srt_fps.currentText(),
                         "smooth_zoom": self.srt_smooth_zoom.isChecked(),
+                    },
+                    "join_video": {
+                        "videos": self.join_videos.paths(),
+                        "output": self.join_output.text(),
+                        "source": self.replace_source.text(),
+                        "replace_videos": self.replace_videos.paths(),
+                        "replace_output": self.replace_output.text(),
+                        "overlay_volume": self.replace_overlay_volume.value(),
+                        "batch_audios": self.batch_join_audios.paths(),
+                        "batch_video_root": self.batch_join_video_root.text(),
+                        "batch_video_volume": self.batch_join_volume.value(),
+                        "batch_quality": self.batch_join_quality.currentText(),
                     },
                 }
             })
@@ -833,10 +1176,15 @@ class CapcutView(QWidget):
             _, project = self._selected_project(self.srt_project)
             quality = validate_quality(self.srt_quality.currentText())
             fps = validate_fps(self.srt_fps.currentText().split()[0])
-            zoom = self.srt_zoom.values()
-            jobs, skipped, errors = prepare_timeline_video_jobs(
-                self.srt_timelines.paths(), self.srt_audios.paths(), self.srt_images.text(),
-                self.srt_output.text() or None,
+            media_type = self._srt_media_type()
+            zoom = self.srt_zoom.values() if media_type == "image" else None
+            prepare_jobs = (
+                prepare_timeline_clip_jobs if media_type == "video"
+                else prepare_timeline_video_jobs
+            )
+            jobs, skipped, errors = prepare_jobs(
+                self.srt_timelines.paths(), self.srt_audios.paths(),
+                self.srt_media_folder.text(), self.srt_output.text() or None,
             )
         except (OSError, ValueError) as exc:
             self._show_validation_errors([("Cấu hình", str(exc))])
@@ -852,8 +1200,102 @@ class CapcutView(QWidget):
             return
         self._start_worker(
             "srt_video", jobs=jobs, skipped=skipped, quality=quality, fps=fps, zoom=zoom,
-            smooth_zoom=self.srt_smooth_zoom.isChecked(), project=project,
+            smooth_zoom=(self.srt_smooth_zoom.isChecked() if media_type == "image" else False),
+            project=project,
         )
+
+    @staticmethod
+    def _validate_mp4_output(path):
+        if not path:
+            raise ValueError("Hãy chọn file output.")
+        if Path(path).suffix.lower() != ".mp4":
+            raise ValueError("File output phải có đuôi .mp4.")
+
+    def start_merge_videos(self):
+        if self.is_processing:
+            return
+        try:
+            videos = self.join_videos.paths()
+            if len(videos) < 2:
+                raise ValueError("Hãy chọn ít nhất 2 file MP4 để ghép.")
+            self._validate_mp4_output(self.join_output.text())
+            self._start_worker("merge_videos", videos=videos, output=self.join_output.text())
+        except ValueError as exc:
+            self._show_error(str(exc))
+
+    def start_replace_intro(self):
+        if self.is_processing:
+            return
+        try:
+            if not Path(self.replace_source.text()).is_file():
+                raise ValueError("Hãy chọn video nguồn MP4 hợp lệ.")
+            videos = self.replace_videos.paths()
+            if not videos:
+                raise ValueError("Hãy chọn ít nhất 1 file MP4 để ghi đè đoạn đầu.")
+            self._validate_mp4_output(self.replace_output.text())
+            self._start_worker(
+                "replace_intro", source=self.replace_source.text(), videos=videos,
+                output=self.replace_output.text(),
+                overlay_volume=self.replace_overlay_volume.value(),
+            )
+        except ValueError as exc:
+            self._show_error(str(exc))
+
+    def start_video_audio_batch(self):
+        if self.is_processing:
+            return
+        jobs, skipped, errors = prepare_video_audio_batch_jobs(
+            self.batch_join_audios.paths(), self.batch_join_video_root.text(),
+        )
+        if errors:
+            self.status.setText(f"Dữ liệu chưa hợp lệ: {len(errors)} lỗi — chưa render video nào")
+            self.progress.setRange(0, 1)
+            self.progress.setValue(0)
+            self.progress.setFormat("Kiểm tra thất bại")
+            self._show_result(
+                "Dữ liệu chưa hợp lệ — chưa render video nào",
+                [(name, reason) for name, reason in errors], True,
+            )
+            self._show_video_audio_error_dialog(
+                errors, "Không thể bắt đầu vì dữ liệu đầu vào chưa hợp lệ."
+            )
+            return
+        if not jobs:
+            self._on_completed({
+                "operation": "video_audio_batch", "success": [],
+                "skipped": skipped, "errors": [], "encoder": None,
+                "video_volume": self.batch_join_volume.value(),
+                "quality": self.batch_join_quality.currentText(),
+            })
+            return
+        self._start_worker(
+            "video_audio_batch", jobs=jobs, skipped=skipped,
+            video_volume=self.batch_join_volume.value(),
+            quality=validate_quality(self.batch_join_quality.currentText()),
+        )
+
+    def _show_video_audio_error_dialog(self, errors, heading):
+        if not errors:
+            return
+        details = "\n\n".join(
+            f"{index}. {name}\n   {reason}"
+            for index, (name, reason) in enumerate(errors, 1)
+        )
+        visible_errors = errors[:8]
+        preview = "\n\n".join(
+            f"{index}. {name}\n   {reason}"
+            for index, (name, reason) in enumerate(visible_errors, 1)
+        )
+        if len(errors) > len(visible_errors):
+            preview += f"\n\n… và {len(errors) - len(visible_errors)} lỗi khác."
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Critical)
+        dialog.setWindowTitle("Lỗi tạo video hàng loạt")
+        dialog.setText(f"{heading}\nTổng cộng: {len(errors)} lỗi.")
+        dialog.setInformativeText(preview)
+        dialog.setDetailedText(details)
+        dialog.setStandardButtons(QMessageBox.StandardButton.Ok)
+        dialog.exec()
 
     def _show_validation_errors(self, errors):
         self.status.setText(f"Dữ liệu chưa hợp lệ: {len(errors)} lỗi — chưa render video nào")
@@ -879,23 +1321,38 @@ class CapcutView(QWidget):
             return
         self.result_group.hide()
         self._set_controls(False)
-        can_stop = operation in ("export", "batch", "srt_video")
+        can_stop = operation in (
+            "export", "batch", "srt_video", "merge_videos", "replace_intro",
+            "video_audio_batch",
+        )
         self.btn_stop.setEnabled(can_stop)
         self.btn_srt_stop.setEnabled(can_stop)
+        self.btn_join_stop.setEnabled(can_stop)
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
         self.progress.setFormat("Đang chuẩn bị...")
+        operation_labels = {
+            "timeline": "Tạo timeline", "clear": "Dọn dự án",
+            "export": "Xuất video", "batch": "Xuất hàng loạt",
+            "srt_video": "Render timeline", "merge_videos": "Ghép video",
+            "replace_intro": "Ghi đè đoạn đầu",
+            "video_audio_batch": "Tạo video hàng loạt từ MP3",
+        }
+        self.current_operation_label = operation_labels.get(operation, operation)
         self.worker = CapcutWorker(operation, **options)
         self.worker.progress.connect(self._on_progress)
         self.worker.completed.connect(self._on_completed)
         self.worker.failed.connect(self._on_failed)
         self.worker.start()
+        activity("[CapCut] Bắt đầu: %s", self.current_operation_label)
 
     def stop_processing(self):
         if self.is_processing:
+            activity("[CapCut] Đang dừng sau đoạn hiện tại")
             self.worker.stop()
             self.btn_stop.setEnabled(False)
             self.btn_srt_stop.setEnabled(False)
+            self.btn_join_stop.setEnabled(False)
             self.status.setText("Đang dừng sau đoạn hiện tại...")
 
     def _set_controls(self, enabled):
@@ -907,11 +1364,13 @@ class CapcutView(QWidget):
         self.progress.setRange(0, max(1, total))
         self.progress.setValue(current)
         self.progress.setFormat(f"{current}/{total}")
+        log_progress("CapCut", current, total, text)
 
     def _on_completed(self, result):
         self._set_controls(True)
         self.btn_stop.setEnabled(False)
         self.btn_srt_stop.setEnabled(False)
+        self.btn_join_stop.setEnabled(False)
         stopped = result.get("stopped", False)
         operation = result.get("operation")
         rows = []
@@ -936,6 +1395,36 @@ class CapcutView(QWidget):
             details = result.get("skipped", []) + result.get("errors", [])
             if details:
                 rows.append(("Chi tiết", "; ".join(f"{name}: {reason}" for name, reason in details)))
+        elif operation in ("merge_videos", "replace_intro"):
+            rows = [
+                ("Video kết quả", result.get("output", "—")),
+                ("Số video con", result.get("clips", 0)),
+                ("Chế độ", "Ghép thành một video" if operation == "merge_videos" else "Ghi đè đoạn đầu"),
+            ]
+            if operation == "replace_intro":
+                rows.append((
+                    "Âm lượng video ghi đè",
+                    f"{result.get('overlay_volume', 100):g}%",
+                ))
+            rows.append(("Encoder", result.get("encoder") or "Tự động"))
+        elif operation == "video_audio_batch":
+            success = result.get("success", [])
+            skipped = result.get("skipped", [])
+            errors = result.get("errors", [])
+            rows = [
+                ("Xuất thành công", len(success)),
+                ("Bỏ qua vì đã có MP4", len(skipped)),
+                ("Lỗi khi render", len(errors)),
+                ("Âm lượng video", f"{result.get('video_volume', 0):g}%"),
+                ("Âm lượng MP3", "100%"),
+                ("Độ phân giải", result.get("quality", "1080P")),
+                ("Encoder", result.get("encoder") or "Tự động"),
+            ]
+            details = [f"{name}: {path}" for name, path, *_ in success]
+            details.extend(f"{name}: {reason}" for name, reason in skipped)
+            details.extend(f"{name}: {reason}" for name, reason in errors)
+            if details:
+                rows.append(("Chi tiết", "; ".join(details)))
         self.status.setText("Đã dừng" if stopped else "Đã chạy xong")
         self.progress.setValue(self.progress.maximum())
         self.progress.setFormat("Đã dừng" if stopped else "Hoàn tất")
@@ -943,14 +1432,29 @@ class CapcutView(QWidget):
             self._show_srt_results(result.get("records", []), result, stopped)
         else:
             self._show_result("Đã dừng" if stopped else "Đã chạy xong", rows, stopped)
+        if operation == "video_audio_batch" and result.get("errors"):
+            self._show_video_audio_error_dialog(
+                result["errors"],
+                "Một số MP3 không tạo được video. Các MP3 khác vẫn được giữ kết quả.",
+            )
+        activity(
+            "[CapCut] %s: %s",
+            "Đã dừng" if stopped else "Hoàn tất",
+            getattr(self, "current_operation_label", operation or "tác vụ"),
+        )
 
     def _on_failed(self, message):
         self._set_controls(True)
         self.btn_stop.setEnabled(False)
         self.btn_srt_stop.setEnabled(False)
+        self.btn_join_stop.setEnabled(False)
         self.progress.setFormat("Lỗi")
         self.status.setText("Tác vụ thất bại")
         self._show_error(message)
+        logging.error(
+            "[CapCut] %s thất bại: %s",
+            getattr(self, "current_operation_label", "Tác vụ"), message,
+        )
 
     def _show_result(self, title, rows, error=False):
         self.result_group.setTitle("Kết quả gần nhất")

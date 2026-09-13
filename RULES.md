@@ -25,16 +25,18 @@ E:\GG\
 │   │   ├── database.py    # Cấu hình SQLAlchemy
 │   │   └── models.py      # Định nghĩa các bảng (Account, Task, ImageSession, VideoSession, GeminiBatch)
 │   ├── ui/                # Giao diện người dùng (PyQt6)
-│   │   ├── components/    # Các widget UI dùng chung (buttons, dialogs, ...)
+│   │   ├── components/    # Widget dùng chung (thumbnail_loader.py, prompt_editor.py)
 │   │   ├── views/         # Các tab chính (flow_image.py, flow_video.py, gemini.py, accounts.py)
 │   │   ├── styles/        # CSS/QSS styling cho UI
 │   │   └── main_window.py # Khởi tạo cửa sổ chính của ứng dụng
 │   ├── common/            # Các tiện ích và module dùng chung
 │   │   ├── gemini_languages.py # Mã file và tên ngôn ngữ có dấu cho Gemini
+│   │   ├── text_splitter.py # Tách text theo giới hạn từ và bảo toàn nguyên văn
 │   │   └── logger.py      # Thiết lập ghi log hệ thống và phiên chạy
 │   └── main.py            # Entry point của ứng dụng
 ├── PLAN.md                # Kế hoạch phát triển và quản lý các đầu việc
 ├── RULES.md               # Quy tắc dự án (File này)
+├── tests/                 # Kiểm thử tự động cho logic xử lý
 ├── run.bat                # File launcher khởi chạy nhanh tool trên Windows
 └── requirements.txt       # Các thư viện phụ thuộc (PyQt6, playwright, sqlalchemy, ...)
 ```

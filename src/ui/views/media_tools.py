@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
 )
 
 from core.system_config import load_system_config, save_system_config
+from common.logger import activity, progress as log_progress
 
 
 SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
@@ -595,9 +596,11 @@ class MediaToolsView(QWidget):
         self.worker.processing_finished.connect(self._on_finished)
         self.worker.fatal_error.connect(self._on_fatal_error)
         self.worker.start()
+        activity("[Sửa Ảnh/Video] Bắt đầu xử lý 0/%s file", len(images))
 
     def stop_processing(self):
         if self.is_processing:
+            activity("[Sửa Ảnh/Video] Đang dừng sau file hiện tại")
             self.worker.stop()
             self.btn_stop.setEnabled(False)
             self.progress_bar.setFormat("Đang dừng sau file hiện tại...")
@@ -606,6 +609,7 @@ class MediaToolsView(QWidget):
         self.progress_bar.setMaximum(max(1, total))
         self.progress_bar.setValue(current)
         self.progress_bar.setFormat(f"Đang xử lý: {current}/{total}")
+        log_progress("Sửa Ảnh/Video", current, total)
 
     def _on_finished(self, counts, stopped):
         self.btn_start.setEnabled(True)
@@ -621,12 +625,18 @@ class MediaToolsView(QWidget):
             f"color:{'#f59e0b' if stopped else '#22c55e'};font-size:16px;font-weight:800;"
         )
         self.result_group.setVisible(True)
+        activity(
+            "[Sửa Ảnh/Video] %s: %s/%s file (thành công %s, bỏ qua %s, lỗi %s)",
+            "Đã dừng" if stopped else "Hoàn tất", processed, counts["total"],
+            counts["success"], counts["skipped"], counts["error"],
+        )
 
     def _on_fatal_error(self, message):
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.progress_bar.setFormat("Dừng do lỗi")
         self._show_inline_error(f"Không thể xử lý: {message}")
+        logging.error("[Sửa Ảnh/Video] Dừng do lỗi: %s", message)
 
     def _update_summary(self, counts):
         self.lbl_total.setText(f"Tổng: {counts['total']}")

@@ -16,10 +16,14 @@ def _first_visible(locator):
 
 def enter_flow_app(page, timeout=30000):
     """Enter the actual Flow application from its public marketing landing page."""
+    cta_name = re.compile(
+        r"^(?:Create with Google Flow|Tạo bằng Google Flow|Dùng thử Google Flow)$",
+        re.I,
+    )
     cta_candidates = page.get_by_role(
-        "button", name="Create with Google Flow", exact=True
+        "button", name=cta_name
     ).or_(page.get_by_role(
-        "link", name="Create with Google Flow", exact=True
+        "link", name=cta_name
     ))
     cta = _first_visible(cta_candidates)
     if cta is None:
@@ -62,16 +66,38 @@ def enter_flow_app(page, timeout=30000):
 
 def dismiss_dashboard_promos(page):
     """Close dashboard banners/cards that can intercept the New project click."""
+    closed = 0
+    # Cookie consent and the low-credit banner can cover the New project button.
+    # Dismiss these exact components even while the dashboard is still hydrating.
+    blockers = page.locator(
+        'button.glue-cookie-notification-bar__accept, '
+        'button:text-is("OK, got it"), '
+        'flow-credit-banner button:has(mat-icon:text-is("close")), '
+        'flow-credit-banner button:has(i:text-is("close"))'
+    )
+    for index in range(blockers.count() - 1, -1, -1):
+        button = blockers.nth(index)
+        try:
+            if button.is_visible():
+                button.click(force=True)
+                closed += 1
+                page.wait_for_timeout(250)
+        except Exception:
+            continue
+
     dashboard = _first_visible(page.locator(
         'button:has-text("Dự án mới"), button:has-text("New project")'
     ))
     if dashboard is None:
-        return 0
+        if closed:
+            logging.info("[Flow] Đã đóng %s lớp thông báo che giao diện.", closed)
+        return closed
 
-    closed = 0
     # On the dashboard Flow uses an icon-only `close` button for the large promo
     # card and the daily-credit banner; neither one is a dialog/modal.
     close_buttons = page.locator(
+        'button:has(mat-icon.material-icons:text-is("close")), '
+        'button:has(mat-icon.google-symbols:text-is("close")), '
         'button:has(i.material-icons:text-is("close")), '
         'button:has(i.google-symbols:text-is("close"))'
     )
@@ -85,7 +111,7 @@ def dismiss_dashboard_promos(page):
         except Exception:
             continue
     if closed:
-        logging.info("[Flow] Đã đóng %s banner quảng cáo trên dashboard.", closed)
+        logging.info("[Flow] Đã đóng %s lớp thông báo/banner trên dashboard.", closed)
     return closed
 
 
@@ -203,12 +229,15 @@ def click_generate(page, prompt_input):
     """Click the submit button tied to the active prompt instead of using shortcuts."""
     panel = _prompt_panel(prompt_input)
     create_btn = _first_visible(panel.locator(
+        'button.generate-icon-button:has(mat-icon:text-is("arrow_forward")), '
+        'button[aria-label="Bắt đầu tạo"], button[aria-label="Start creating"], '
         'button:has(i.google-symbols:has-text("arrow_forward")), '
         'button:has(i.material-icons:has-text("arrow_forward")), '
         'button:has(i:has-text("arrow_forward"))'
     ))
     if create_btn is None:
         create_btn = _first_visible(panel.locator(
+            'button.generate-icon-button:has(mat-icon:text-is("send")), '
             'button:has(i.google-symbols:has-text("send")), '
             'button:has(i.material-icons:has-text("send")), '
             'button:has(i:has-text("send"))'
@@ -272,7 +301,11 @@ def _classic_config_button(page):
 
 
 def _visible_menu(page):
-    menus = page.locator('[role="menu"], [data-radix-menu-content], .DropdownMenuContent')
+    menus = page.locator(
+        '[role="menu"], [data-radix-menu-content], .DropdownMenuContent, '
+        '.cdk-overlay-pane:has(flow-prompt-box-settings), '
+        'flow-prompt-box-settings.settings-content-overlay'
+    )
     menu = _first_visible(menus)
     if menu is None:
         raise RuntimeError("Bang cau hinh Flow cu khong mo.")
@@ -280,16 +313,61 @@ def _visible_menu(page):
 
 
 def _click_tab(root, text):
-    pattern = re.compile(rf"^\s*(?:\S+\s+)?{re.escape(text)}\s*$", re.I)
-    candidates = root.locator('button[role="tab"], [role="tab"]').filter(has_text=pattern)
+    duration_match = re.fullmatch(r"(\d+)s", str(text), re.I)
+    if duration_match:
+        duration = re.escape(duration_match.group(1))
+        label = rf"{duration}\s*(?:s|giây|seconds?)"
+    else:
+        label = re.escape(text)
+    pattern = re.compile(rf"^\s*(?:\S+\s+)?{label}\s*$", re.I)
+    candidates = root.locator(
+        'button[role="tab"], [role="tab"], button[role="radio"], [role="radio"]'
+    ).filter(has_text=pattern)
     tab = _first_visible(candidates)
     if tab is None:
         candidates = root.locator('button').filter(has_text=re.compile(re.escape(text), re.I))
         tab = _first_visible(candidates)
     if tab is None:
         raise RuntimeError(f"Khong tim thay tuy chon '{text}' trong cau hinh Flow.")
-    if tab.get_attribute("aria-selected") != "true":
+    selected_state = (
+        tab.get_attribute("aria-selected") or tab.get_attribute("aria-checked")
+    )
+    if selected_state == "true":
+        return
+    for _ in range(3):
         tab.click(force=True)
+        tab.page.wait_for_timeout(250)
+        selected_state = (
+            tab.get_attribute("aria-selected") or tab.get_attribute("aria-checked")
+        )
+        # Some Flow variants expose controls without a selected-state attribute.
+        if selected_state is None or selected_state == "true":
+            return
+    raise RuntimeError(f"Flow khong ghi nhan tuy chon '{text}'.")
+
+
+def _click_optional_tab(root, text):
+    duration_match = re.fullmatch(r"(\d+)s", str(text), re.I)
+    if duration_match:
+        duration = re.escape(duration_match.group(1))
+        label = rf"{duration}\s*(?:s|giây|seconds?)"
+    else:
+        label = re.escape(text)
+    pattern = re.compile(rf"^\s*(?:\S+\s+)?{label}\s*$", re.I)
+    candidates = root.locator(
+        'button[role="tab"], [role="tab"], button[role="radio"], [role="radio"]'
+    ).filter(
+        has_text=pattern
+    )
+    tab = _first_visible(candidates)
+    if tab is None:
+        candidates = root.locator('button').filter(has_text=pattern)
+        tab = _first_visible(candidates)
+    if tab is None:
+        logging.info("[Flow] Model nay khong co tuy chon '%s'; bo qua.", text)
+        return False
+    _click_tab(root, text)
+    return True
 
 
 def _select_model(page, root, model_name):
@@ -302,16 +380,33 @@ def _select_model(page, root, model_name):
         return
     trigger.click(force=True)
     page.wait_for_timeout(300)
+    expected_name = model_name
     option = page.locator('[role="menuitem"], [role="option"]').filter(
         has_text=re.compile(re.escape(model_name), re.I)
     )
     item = _first_visible(option)
+    if item is None:
+        item = _first_visible(page.locator('button').filter(
+            has_text=re.compile(re.escape(model_name), re.I)
+        ))
+    if item is None and "Lower Priority" in model_name:
+        logging.warning(
+            "[Flow] Rollout nay khong co Lite [Lower Priority]; dung Veo 3.1 - Lite."
+        )
+        fallback = page.locator('[role="menuitem"], [role="option"], button').filter(
+            has_text=re.compile(r"Veo\s*3\.1\s*-\s*Lite", re.I)
+        )
+        item = _first_visible(fallback)
+        expected_name = "Veo 3.1 - Lite"
     if item is None:
         raise RuntimeError(f"Khong tim thay model '{model_name}' tren Google Flow.")
     try:
         item.click(force=True)
     except Exception:
         item.evaluate("element => element.click()")
+    page.wait_for_timeout(250)
+    if expected_name.lower() not in trigger.inner_text().lower():
+        raise RuntimeError(f"Flow khong ghi nhan model '{model_name}'.")
 
 
 def configure_classic_image(page, config):
@@ -334,17 +429,11 @@ def configure_classic_video(page, config):
     menu = _visible_menu(page)
     _click_tab(menu, "Video")
 
-    selected_model = config.get("model", "Veo 3.1 - Fast [20 Credit]")
-    keyword = "Fast"
-    if "Lite" in selected_model:
-        keyword = "Lite"
-    elif "Flash" in selected_model or "Omni" in selected_model:
-        keyword = "Omni"
-    elif "Quality" in selected_model:
-        keyword = "Quality"
-    _select_model(page, menu, keyword)
+    model = _video_model_value(config.get("model", "Veo 3.1 - Fast"))
+    _select_model(page, menu, model)
     _click_tab(menu, _ratio_value(config.get("aspect_ratio", "16:9")))
-    _click_tab(menu, "x1")
+    _click_optional_tab(menu, _duration_value(config.get("duration", "8s")))
+    _click_tab(menu, f"x{_video_count_value(config.get('images_per_prompt', 1))}")
 
 
 def _ratio_value(value):
@@ -363,25 +452,77 @@ def _image_model_value(value):
     return "Nano Banana 2"
 
 
+def _video_model_value(value):
+    value = str(value)
+    if "Omni" in value or "Flash" in value:
+        return "Omni 1.1 Flash"
+    if "Lower Priority" in value:
+        return "Veo 3.1 - Lite [Lower Priority]"
+    if "Lite" in value:
+        return "Veo 3.1 - Lite"
+    if "Quality" in value:
+        return "Veo 3.1 - Quality"
+    return "Veo 3.1 - Fast"
+
+
+def _duration_value(value):
+    match = re.search(r"\b(4|6|8)\s*s?\b", str(value), re.I)
+    return f"{match.group(1)}s" if match else "8s"
+
+
+def _video_count_value(value):
+    try:
+        return min(4, max(1, int(value)))
+    except (TypeError, ValueError):
+        return 1
+
+
 def _agent_settings_panel(page, prompt_input):
     existing = page.get_by_text(
         re.compile(r"^\s*(Cài đặt tác nhân|Agent settings)\s*$", re.I)
     ).first
     if not existing.is_visible():
-        prompt_panel = _prompt_panel(prompt_input)
-        settings_btn = _first_visible(prompt_panel.locator(
+        # Flow ignores the first toolbar interaction until the composer is active.
+        prompt_input.click(force=True)
+        page.wait_for_timeout(300)
+        settings_btn = _first_visible(page.locator(
             'button:has-text("tune"), '
             'button[aria-label*="agent settings" i], '
             'button[aria-label*="cài đặt tác nhân" i]'
         ))
         if settings_btn is None:
             raise RuntimeError("Khong tim thay nut mo Cai dat tac nhan cua Flow moi.")
-        settings_btn.click(force=True)
-        existing.wait_for(state="visible", timeout=10000)
-
-    panel = existing.locator(
-        'xpath=ancestor::*[.//button[contains(., "Lưu") or contains(., "Save")]][1]'
-    )
+        # The current rollout labels this drawer simply "Cài đặt", so use its
+        # video-model control as the stable loaded marker instead of its title.
+        video_model = page.locator(
+            'button:has-text("Veo 3.1"), '
+            'button:has-text("Omni 1.1"), '
+            'button:has-text("Flash")'
+        ).first
+        last_error = None
+        for _ in range(3):
+            settings_btn.click(force=True)
+            try:
+                video_model.wait_for(state="visible", timeout=5000)
+                break
+            except Exception as exc:
+                last_error = exc
+                settings_btn = _first_visible(page.locator(
+                    'button:has-text("tune"), '
+                    'button[aria-label*="agent settings" i], '
+                    'button[aria-label*="cài đặt tác nhân" i]'
+                ))
+                if settings_btn is None:
+                    break
+        if not video_model.is_visible():
+            raise RuntimeError("Flow khong mo bang Cai dat sau 3 lan bam.") from last_error
+        panel = video_model.locator(
+            'xpath=ancestor::*[.//button[contains(., "Lưu") or contains(., "Save")]][1]'
+        )
+    else:
+        panel = existing.locator(
+            'xpath=ancestor::*[.//button[contains(., "Lưu") or contains(., "Save")]][1]'
+        )
     if not panel.count():
         raise RuntimeError("Khong xac dinh duoc panel Cai dat tac nhan cua Flow moi.")
     return panel
@@ -411,6 +552,17 @@ def _click_following_tab(heading, text):
     raise RuntimeError(f"Flow moi khong ghi nhan tuy chon '{text}'.")
 
 
+def _click_optional_following_tab(heading, text):
+    tab = heading.locator(
+        f'xpath=following::button[@role="tab" and contains(normalize-space(.), "{text}")][1]'
+    )
+    if not tab.count() or not tab.is_visible():
+        logging.info("[Flow] Giao dien nay khong co tuy chon '%s'; bo qua.", text)
+        return False
+    _click_following_tab(heading, text)
+    return True
+
+
 def _select_following_model(page, heading, model_names, requested):
     conditions = " or ".join(f'contains(., "{name}")' for name in model_names)
     trigger = heading.locator(f'xpath=following::button[{conditions}][1]')
@@ -423,6 +575,18 @@ def _select_following_model(page, heading, model_names, requested):
         has_text=re.compile(re.escape(requested), re.I)
     )
     item = _first_visible(option)
+    if item is None:
+        item = _first_visible(page.locator('button').filter(
+            has_text=re.compile(re.escape(requested), re.I)
+        ))
+    if item is None and "Lower Priority" in requested:
+        logging.warning(
+            "[Flow] Rollout Agent nay khong co Lite [Lower Priority]; dung Veo 3.1 - Lite."
+        )
+        fallback = page.locator('[role="menuitem"], [role="option"], button').filter(
+            has_text=re.compile(r"Veo\s*3\.1\s*-\s*Lite", re.I)
+        )
+        item = _first_visible(fallback)
     if item is None:
         raise RuntimeError(f"Khong tim thay model '{requested}' trong Flow moi.")
     try:
@@ -455,17 +619,14 @@ def configure_agent_defaults(page, prompt_input, media_type, config):
         model = _image_model_value(config.get("model", "Nano Banana 2"))
         _select_following_model(page, heading, ("Nano", "Banana", "Imagen"), model)
     else:
-        _click_following_tab(heading, "x1")
-        selected = config.get("model", "Veo 3.1 - Fast [20 Credit]")
-        if "Omni" in selected or "Flash" in selected:
-            model = "Omni Flash"
-        elif "Lite" in selected:
-            model = "Veo 3.1 - Lite"
-        elif "Quality" in selected:
-            model = "Veo 3.1 - Quality"
-        else:
-            model = "Veo 3.1 - Fast"
+        model = _video_model_value(config.get("model", "Veo 3.1 - Fast"))
         _select_following_model(page, heading, ("Veo", "Omni", "Flash"), model)
+        _click_optional_following_tab(
+            heading, _duration_value(config.get("duration", "8s"))
+        )
+        _click_following_tab(
+            heading, f"x{_video_count_value(config.get('images_per_prompt', 1))}"
+        )
 
     save = _first_visible(panel.locator('button').filter(
         has_text=re.compile(r"^\s*(Lưu|Save)\s*$", re.I)

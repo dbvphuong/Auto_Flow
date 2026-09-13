@@ -9,15 +9,22 @@ from common.gemini_languages import LANGUAGE_BY_COUNTRY
 from .automations.gemini import run_gemini, GeminiStopped, GeminiProUnavailable
 from .automations.image_fx import run_image_fx
 from .automations.video_fx import run_video_fx
-from .browser_manager import parse_proxy
-from .system_config import load_system_config
+from .system_config import (
+    CHROME_RUN_MODE_VISIBLE,
+    get_chrome_run_mode,
+    load_system_config,
+)
+from .account_selection import account_enabled_for_task, enabled_accounts_query
+from common.urban_vpn import DIRECT_CODE, vpn_location_for_attempt
 
 GEMINI_MAX_RETRIES = 3
 AUTOMATION_MAX_RETRIES = 3
 
 
-def _can_retry_flow_task(error_message):
+def _can_retry_flow_task(error_message, error=None):
     """Không tạo lại khi request cũ có thể vẫn chạy hoặc kết quả đã được tạo."""
+    if getattr(error, "retryable", True) is False:
+        return False
     message = (error_message or "").lower()
     no_retry_markers = (
         "không tự retry",
@@ -26,6 +33,21 @@ def _can_retry_flow_task(error_message):
         "không thể tải video",
         "timeout chờ tải ảnh",
         "timeout chờ tải video",
+        "vi phạm chính sách",
+        "người nổi tiếng",
+        "nội dung gây hại",
+        "nội dung tình dục",
+        "may violate our polic",
+        "might violate our polic",
+        "could violate our polic",
+        "violates our polic",
+        "policy violation",
+        "public figure",
+        "celebrity",
+        "harmful content",
+        "sexual content",
+        "safety filter",
+        "blocked for safety",
     )
     return not any(marker in message for marker in no_retry_markers)
 
@@ -35,14 +57,24 @@ class AutomationWorker(QThread):
     error = pyqtSignal(int, str) # task_id, error_msg
     retry_requested = pyqtSignal(int, int, int, str)
 
-    def __init__(self, task_id, target="labs.google/fx", config=None, account_id=None):
+    def __init__(
+        self, task_id, target="labs.google/fx", config=None, account_id=None,
+        window_slot=0, window_count=1,
+    ):
         super().__init__()
         self.task_id = task_id
         self.target = target
         self.config = config or {}
         self.account_id = account_id
+        self.window_slot = window_slot
+        self.window_count = window_count
         self._is_paused = False
         self._is_stopped = False
+
+    def visible_window_slot(self, show_browser):
+        if not show_browser:
+            return None
+        return self.window_slot, self.window_count
 
     def pause(self):
         self._is_paused = True
@@ -65,20 +97,31 @@ class AutomationWorker(QThread):
 
             return
             
-        # Get specified account or fallback to active account
+        # Use only accounts explicitly enabled for this task's flow. Account
+        # status is informational and must not control Image/Video routing.
         if self.account_id:
             account = db.query(Account).filter(Account.id == self.account_id).first()
         else:
-            account = db.query(Account).filter(Account.is_active == True).order_by(Account.position.asc()).first()
+            account = enabled_accounts_query(db, task.task_type).first()
+
+        if account and not account_enabled_for_task(account, task.task_type):
+            account = None
             
         if not account or not account.cookies_json:
-            logging.error(f"[Worker {self.task_id}] Không tìm thấy tài khoản hoạt động nào để chạy.")
-            self.error.emit(self.task_id, "Không có tài khoản khả dụng hoặc chưa có cookie.")
+            logging.error(
+                "[Worker %s] Không có tài khoản được bật cho luồng %s hoặc tài khoản chưa có cookie.",
+                self.task_id, task.task_type,
+            )
+            self.error.emit(
+                self.task_id,
+                f"Không có tài khoản được tích cột {task.task_type} hoặc tài khoản chưa có cookie.",
+            )
             db.close()
             return
             
         task.status = "RUNNING"
         task.account_id = account.id
+        task.error_message = None
         db.commit()
         
         while self._is_paused and not self._is_stopped:
@@ -99,17 +142,31 @@ class AutomationWorker(QThread):
             with sync_playwright() as p:
                 from .browser_manager import launch_chrome_and_connect
                 chrome_profile = account.chrome_profile or "_tool_profile_"
-                proxy_str = account.proxy if account.use_proxy else None
                 system_config = load_system_config()
-                show_browser = bool(system_config.get("show_chrome_when_running", False))
+                chrome_run_mode = get_chrome_run_mode(system_config)
+                show_browser = chrome_run_mode == CHROME_RUN_MODE_VISIBLE
+                is_ultra = "ULTRA" in (account.account_type or "").upper()
+                vpn_country = DIRECT_CODE
+                if bool(account.use_vpn) and is_ultra:
+                    vpn_country = vpn_location_for_attempt(
+                        system_config.get("urban_vpn_order"), task.retry_count or 0
+                    )
+                logging.info(
+                    "[Worker %s] Network route: account_vpn=%s; country=%s; attempt=%s; "
+                    "show_browser=%s; window_slot=%s/%s",
+                    self.task_id, bool(account.use_vpn), vpn_country, task.retry_count or 0,
+                    show_browser, self.window_slot + 1, self.window_count,
+                )
                 
                 context = launch_chrome_and_connect(
                     p,
                     account.email,
                     chrome_profile,
-                    proxy_str,
                     task_id=self.task_id,
-                    show_browser=show_browser
+                    window_slot=self.visible_window_slot(show_browser),
+                    show_browser=show_browser,
+                    browser_mode=chrome_run_mode,
+                    urban_vpn_country=vpn_country,
                 )
                 
                 # Nạp cookies từ DB nếu sử dụng profile của tool (mặc định),
@@ -139,6 +196,7 @@ class AutomationWorker(QThread):
                 task.status = "COMPLETED"
                 task.result_path = result if result else "Lỗi khi lưu kết quả"
                 task.retry_count = 0
+                task.error_message = None
                 db.commit()
                 logging.info(f"[Worker {self.task_id}] Hoàn thành task. Kết quả: {task.result_path}")
                 
@@ -148,10 +206,11 @@ class AutomationWorker(QThread):
             err_msg = str(e)
             logging.error(f"[Worker {self.task_id}] Lỗi trong tiến trình chạy automation: {err_msg}")
             retries_done = task.retry_count or 0
+            task.error_message = err_msg
             should_retry = (
                 not self._is_stopped
                 and retries_done < AUTOMATION_MAX_RETRIES
-                and _can_retry_flow_task(err_msg)
+                and _can_retry_flow_task(err_msg, e)
             )
 
             if self._is_stopped or should_retry:
@@ -256,19 +315,20 @@ class GeminiWorker(QThread):
             with sync_playwright() as playwright:
                 from .browser_manager import launch_chrome_and_connect
                 chrome_profile = account.chrome_profile or "_tool_profile_"
-                proxy_str = account.proxy if account.use_proxy else None
-                show_browser = bool(load_system_config().get("show_chrome_when_running", False))
+                chrome_run_mode = get_chrome_run_mode(load_system_config())
+                show_browser = chrome_run_mode == CHROME_RUN_MODE_VISIBLE
                 logging.info(
-                    "[Gemini Worker %s] Mở Chrome; profile=%s; proxy_enabled=%s; "
+                    "[Gemini Worker %s] Mở Chrome; profile=%s; vpn_enabled=%s; "
                     "show_browser=%s; window_slot=%s/%s",
-                    self.batch_id, chrome_profile, bool(proxy_str), show_browser,
+                    self.batch_id, chrome_profile, False, show_browser,
                     self.window_slot + 1, self.window_count,
                 )
                 context = launch_chrome_and_connect(
-                    playwright, account.email, chrome_profile, proxy_str,
+                    playwright, account.email, chrome_profile, None,
                     task_id=f"gemini_{self.batch_id}",
-                    window_slot=(self.window_slot, self.window_count),
+                    window_slot=(self.window_slot, self.window_count) if show_browser else None,
                     show_browser=show_browser,
+                    browser_mode=chrome_run_mode,
                     preserve_profile_data=True,
                 )
                 logging.info(

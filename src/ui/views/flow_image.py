@@ -12,6 +12,9 @@ import os
 from data.database import SessionLocal
 from data.models import Task, Account, ImageSession
 from core.workers import AutomationWorker, AUTOMATION_MAX_RETRIES
+from core.account_selection import enabled_accounts_query
+from common.logger import activity, progress as log_progress, warning as log_warning
+from ui.components.prompt_editor import PromptCellWidget, TaskPromptEditDialog
 
 
 from PyQt6.QtWidgets import QDialog, QDialogButtonBox
@@ -1188,7 +1191,12 @@ class FlowImageView(QWidget):
 
             prompt_item = QTableWidgetItem(task.prompt)
             prompt_item.setData(Qt.ItemDataRole.UserRole, task.id)
+            prompt_item.setFlags(prompt_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.table_tasks.setItem(row_idx, 3, prompt_item)
+            self.table_tasks.setCellWidget(
+                row_idx, 3,
+                PromptCellWidget(task.id, task.prompt, self.edit_task_prompt),
+            )
 
             result_item = QTableWidgetItem(task.result_path or "")
             result_item.setFlags(result_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
@@ -1224,6 +1232,56 @@ class FlowImageView(QWidget):
                     db.commit()
                 db.close()
         
+    def edit_task_prompt(self, task_id):
+        db = SessionLocal()
+        try:
+            task = db.query(Task).filter(Task.id == task_id).first()
+            if not task:
+                QMessageBox.warning(self, "Không tìm thấy", "Task này không còn tồn tại.")
+                return
+            if task.status == "RUNNING":
+                QMessageBox.information(
+                    self, "Task đang chạy",
+                    "Không thể sửa prompt khi task đang chạy. Hãy dừng task trước.",
+                )
+                return
+            dialog = TaskPromptEditDialog(task.prompt, self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            prompt = dialog.prompt()
+            if task.session_id:
+                session = db.query(ImageSession).filter(
+                    ImageSession.id == task.session_id
+                ).first()
+                session_tasks = db.query(Task).filter(
+                    Task.session_id == task.session_id,
+                    Task.task_type == "image",
+                ).order_by(Task.id.asc()).all()
+                task_ids = [item.id for item in session_tasks]
+                prompts = [
+                    value.strip() for value in (session.prompts_text or "").splitlines()
+                    if value.strip()
+                ] if session else []
+                if session and len(prompts) == len(task_ids) and task_id in task_ids:
+                    prompts[task_ids.index(task_id)] = prompt
+                    session.prompts_text = "\n".join(prompts)
+                    session.status = "PENDING"
+            task.prompt = prompt
+            task.status = "PENDING"
+            task.result_path = None
+            task.account_id = None
+            task.retry_count = 0
+            task.error_message = None
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            logging.error("[Flow Ảnh] Không thể lưu prompt task #%s: %s", task_id, exc)
+            QMessageBox.critical(self, "Không thể lưu", f"Lỗi khi lưu prompt:\n{exc}")
+            return
+        finally:
+            db.close()
+        self.load_tasks()
+
     def filter_table(self):
         filter_text = self.combo_filter.currentText()
         for i in range(self.table_tasks.rowCount()):
@@ -1345,10 +1403,10 @@ class FlowImageView(QWidget):
         logging.info("[UI] Bắt đầu chạy tuần tự theo phiên.")
         
         db = SessionLocal()
-        active_account = db.query(Account).filter(Account.is_active == True).order_by(Account.position.asc()).first()
+        active_account = enabled_accounts_query(db, "image").first()
         db.close()
         if not active_account:
-            QMessageBox.warning(self, "Thiếu tài khoản", "Vui lòng thêm hoặc kích hoạt ít nhất một tài khoản ở tab 'Cài đặt hệ thống'!")
+            QMessageBox.warning(self, "Thiếu tài khoản", "Vui lòng tích cột Ảnh cho ít nhất một tài khoản ở tab 'Cài đặt hệ thống'!")
             return
 
         selected_sess_ids = []
@@ -1702,14 +1760,14 @@ class FlowImageView(QWidget):
                 # Phân bổ tài khoản thông minh (Load balancing)
                 # 1. Lấy danh sách các tài khoản active từ DB
                 db = SessionLocal()
-                active_accounts = db.query(Account).filter(Account.is_active == True).order_by(Account.position.asc()).all()
+                active_accounts = enabled_accounts_query(db, "image").all()
                 queued_task = db.query(Task).filter(Task.id == task_info['task_id']).first()
                 previous_account_id = task_info.get('avoid_account_id')
                 if (previous_account_id is None and queued_task
                         and (queued_task.retry_count or 0) > 0):
                     previous_account_id = queued_task.account_id
                 db.close()
-                
+
                 selected_account_id = None
                 if active_accounts:
                     # 2. Đếm số lượng tasks đang chạy của từng tài khoản active
@@ -1757,7 +1815,7 @@ class FlowImageView(QWidget):
 
     def pause_tasks(self):
         if "TẠM DỪNG" in self.btn_pause.text():
-            logging.info("[UI] Tạm dừng các tasks.")
+            activity("[Flow Ảnh] Đã tạm dừng")
             self.anim_timer.stop()
             self.hourglass_icon = "⏳"
             self.update_stats_display()
@@ -1784,7 +1842,7 @@ class FlowImageView(QWidget):
                 }
             """)
         else:
-            logging.info("[UI] Tiếp tục chạy các tasks.")
+            activity("[Flow Ảnh] Tiếp tục chạy")
             self.anim_timer.start(500)
             if getattr(self, 'queue_timer', None):
                 self.queue_timer.start(1000)
@@ -1810,7 +1868,7 @@ class FlowImageView(QWidget):
             """)
 
     def stop_tasks(self):
-        logging.info("[UI] Dừng toàn bộ các tasks và xóa hàng chờ.")
+        activity("[Flow Ảnh] Đang dừng toàn bộ tác vụ")
         if getattr(self, 'queue_timer', None) and self.queue_timer.isActive():
             self.queue_timer.stop()
         self.task_queue.clear()
@@ -1888,6 +1946,10 @@ class FlowImageView(QWidget):
             clean_status = status.lstrip("⏳⌛ ").strip()
             status = f"{self.hourglass_icon} {clean_status}"
         self.update_table_row(task_id, 5, status)
+        log_progress(
+            "Flow Ảnh", self.stats_processed, self.stats_total,
+            f"Task #{task_id}: {status}",
+        )
 
     def on_task_finished(self, task_id, result_path):
         self.update_table_row(task_id, 4, result_path)
@@ -1895,16 +1957,19 @@ class FlowImageView(QWidget):
         self.stats_processed += 1
         self.stats_success += 1
         self.update_stats_display()
+        log_progress(
+            "Flow Ảnh", self.stats_processed, self.stats_total,
+            f"Hoàn thành task #{task_id}",
+        )
         self.check_and_advance_batch_session(task_id)
 
     def on_task_retry(self, task_id, account_id, retry_number, error_msg, task_info):
         task_info['avoid_account_id'] = account_id
         if not any(item['task_id'] == task_id for item in self.task_queue):
             self.task_queue.append(task_info)
-        logging.warning(
-            "[Image Queue] Task %s retry %s/%s; tránh account %s ở lượt kế; queue=%s",
-            task_id, retry_number, AUTOMATION_MAX_RETRIES,
-            account_id, [item['task_id'] for item in self.task_queue],
+        log_warning(
+            "[Flow Ảnh] Task #%s lỗi, thử lại %s/%s: %s",
+            task_id, retry_number, AUTOMATION_MAX_RETRIES, error_msg,
         )
         self.update_table_row(
             task_id, 5,
@@ -1918,6 +1983,10 @@ class FlowImageView(QWidget):
         self.stats_processed += 1
         self.stats_failure += 1
         self.update_stats_display()
+        logging.error(
+            "[Flow Ảnh] Task #%s thất bại (%s/%s): %s",
+            task_id, self.stats_processed, self.stats_total, error_msg,
+        )
         self.check_and_advance_batch_session(task_id)
         
     def animate_hourglass(self):
@@ -2116,10 +2185,10 @@ class FlowImageView(QWidget):
         logging.info("[UI] Nhấn Chạy mục chọn.")
         
         db = SessionLocal()
-        active_account = db.query(Account).filter(Account.is_active == True).order_by(Account.position.asc()).first()
+        active_account = enabled_accounts_query(db, "image").first()
         db.close()
         if not active_account:
-            QMessageBox.warning(self, "Thiếu tài khoản", "Vui lòng thêm hoặc kích hoạt ít nhất một tài khoản ở tab 'Cài đặt hệ thống'!")
+            QMessageBox.warning(self, "Thiếu tài khoản", "Vui lòng tích cột Ảnh cho ít nhất một tài khoản ở tab 'Cài đặt hệ thống'!")
             return
 
         selected_task_ids = []
@@ -2204,10 +2273,10 @@ class FlowImageView(QWidget):
         logging.info("[UI] Nhấn Chạy lại lỗi.")
         
         db = SessionLocal()
-        active_account = db.query(Account).filter(Account.is_active == True).order_by(Account.position.asc()).first()
+        active_account = enabled_accounts_query(db, "image").first()
         db.close()
         if not active_account:
-            QMessageBox.warning(self, "Thiếu tài khoản", "Vui lòng thêm hoặc kích hoạt ít nhất một tài khoản ở tab 'Cài đặt hệ thống'!")
+            QMessageBox.warning(self, "Thiếu tài khoản", "Vui lòng tích cột Ảnh cho ít nhất một tài khoản ở tab 'Cài đặt hệ thống'!")
             return
 
         db = SessionLocal()
