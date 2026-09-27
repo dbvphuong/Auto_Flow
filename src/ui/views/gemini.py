@@ -175,6 +175,13 @@ class GeminiView(QWidget):
         "PENDING": "#f59e0b", "RUNNING": "#3b82f6",
         "SUCCESS": "#22c55e", "FAILED": "#ef4444",
     }
+    COL_SELECT = 0
+    COL_NAME = 1
+    COL_OUTPUT_DIR = 2
+    COL_ACCOUNT = 3
+    COL_CONTINUATION = 4
+    COL_STATUS = 5
+    COL_DETAIL = 6
 
     def __init__(self):
         super().__init__()
@@ -288,7 +295,7 @@ class GeminiView(QWidget):
         run_layout.addWidget(self.spin_max_continuations, 2, 1)
         run_layout.addWidget(QLabel("Từ khóa Done:"), 3, 0)
         run_layout.addWidget(self.line_done_marker, 3, 1, 1, 2)
-        self.btn_create_queue = QPushButton("＋ TẠO / CẬP NHẬT QUEUE THEO QUỐC GIA")
+        self.btn_create_queue = QPushButton("＋ TẠO THÊM QUEUE THEO QUỐC GIA")
         self.btn_create_queue.setStyleSheet(self._button_style("#2563eb", "#3b82f6"))
         run_layout.addWidget(self.btn_create_queue, 4, 0, 1, 3)
         left_layout.addWidget(run_group)
@@ -307,20 +314,22 @@ class GeminiView(QWidget):
         title_row.addWidget(self.btn_delete)
         right_layout.addLayout(title_row)
 
-        self.table_queue = QTableWidget(0, 6)
+        self.table_queue = QTableWidget(0, 7)
         self.table_queue.setHorizontalHeaderLabels([
-            "Chọn", "Quốc gia / File", "Account đang chạy",
+            "Chọn", "Quốc gia / File", "Thư mục lưu", "Account đang chạy",
             "Lần gõ 1", "Trạng thái", "Kết quả / Lỗi",
         ])
         self.table_queue.verticalHeader().setVisible(False)
         self.table_queue.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         header = self.table_queue.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(self.COL_SELECT, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(self.COL_NAME, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(self.COL_OUTPUT_DIR, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(self.COL_ACCOUNT, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(self.COL_CONTINUATION, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(self.COL_STATUS, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(self.COL_DETAIL, QHeaderView.ResizeMode.Stretch)
+        self.table_queue.setColumnWidth(self.COL_OUTPUT_DIR, 220)
         right_layout.addWidget(self.table_queue, 1)
 
         multi_split_controls = QHBoxLayout()
@@ -485,6 +494,7 @@ class GeminiView(QWidget):
         self.btn_pause.clicked.connect(self.pause_tasks)
         self.btn_stop.clicked.connect(self.stop_tasks)
         self.btn_retry.clicked.connect(self.retry_failed)
+        self.table_queue.cellClicked.connect(self._open_output_folder)
         self.table_queue.cellDoubleClicked.connect(self._open_result)
         for widget_signal in (
             self.text_story.textChanged,
@@ -1225,57 +1235,37 @@ class GeminiView(QWidget):
         master_prompt, story, output_dir, done_marker, countries = values
         maximum = self.spin_max_continuations.value()
         logging.info(
-            "[Gemini UI] Tạo/cập nhật queue; countries=%s; master_chars=%s; story_chars=%s; "
+            "[Gemini UI] Tạo thêm queue; countries=%s; master_chars=%s; story_chars=%s; "
             "output=%s; max_gõ_1=%s; marker=%r",
             countries, len(master_prompt), len(story), output_dir, maximum, done_marker,
         )
         db = SessionLocal()
-        created = updated = 0
+        created = 0
         try:
             for country in countries:
                 display_name = LANGUAGE_BY_COUNTRY.get(country, country)
-                batch = db.query(GeminiBatch).filter(GeminiBatch.country == country).first()
-                if batch and batch.status == "RUNNING":
-                    logging.warning(
-                        "[Gemini UI] Bỏ qua country=%s vì batch id=%s đang RUNNING",
-                        country, batch.id,
-                    )
-                    continue
-                if batch:
-                    updated += 1
-                    batch.name = display_name
-                    batch.story_content = story
-                    batch.master_prompt = master_prompt
-                    batch.output_dir = output_dir
-                    batch.max_continuations = maximum
-                    batch.done_marker = done_marker
-                    batch.total_parts = maximum
-                    batch.current_part = 0
-                    batch.status = "PENDING"
-                    batch.account_id = None
-                    batch.result_path = None
-                    batch.error_message = None
-                    batch.retry_count = 0
-                    logging.info("[Gemini UI] Reset batch id=%s country=%s về PENDING", batch.id, country)
-                else:
-                    created += 1
-                    db.add(GeminiBatch(
-                        name=display_name, country=country, story_content=story,
-                        master_prompt=master_prompt, output_dir=output_dir,
-                        max_continuations=maximum, done_marker=done_marker,
-                        total_parts=maximum, current_part=0, status="PENDING",
-                    ))
-                    logging.info("[Gemini UI] Thêm batch mới country=%s", country)
+                batch = GeminiBatch(
+                    name=display_name, country=country, story_content=story,
+                    master_prompt=master_prompt, output_dir=output_dir,
+                    max_continuations=maximum, done_marker=done_marker,
+                    total_parts=maximum, current_part=0, status="PENDING",
+                )
+                db.add(batch)
+                db.flush()
+                # ID giúp nhiều batch cùng quốc gia và cùng folder không ghi đè file nhau.
+                batch.name = f"{display_name}_{batch.id}"
+                created += 1
+                logging.info(
+                    "[Gemini UI] Thêm batch id=%s country=%s; output_name=%s.txt",
+                    batch.id, country, batch.name,
+                )
             db.commit()
-            logging.info(
-                "[Gemini UI] Commit queue thành công; created=%s; updated=%s",
-                created, updated,
-            )
+            logging.info("[Gemini UI] Commit queue thành công; created=%s", created)
         finally:
             db.close()
         self.load_batches()
         QMessageBox.information(
-            self, "Đã tạo queue", f"Tạo mới: {created} | Cập nhật: {updated} | Tổng chọn: {len(countries)}"
+            self, "Đã tạo queue", f"Đã thêm {created} row mới."
         )
 
     def load_batches(self):
@@ -1302,18 +1292,30 @@ class GeminiView(QWidget):
             checkbox.setChecked(batch.status in ("PENDING", "FAILED"))
             checkbox.toggled.connect(self._sync_all_batches_checkbox)
             layout.addWidget(checkbox)
-            self.table_queue.setCellWidget(row, 0, container)
-            output_name = LANGUAGE_BY_COUNTRY.get(batch.country, batch.name or batch.country)
+            self.table_queue.setCellWidget(row, self.COL_SELECT, container)
+            output_name = batch.name or LANGUAGE_BY_COUNTRY.get(batch.country, batch.country)
             name_item = QTableWidgetItem(f"{output_name}.txt")
             name_item.setData(Qt.ItemDataRole.UserRole, batch.id)
-            self.table_queue.setItem(row, 1, name_item)
-            self.table_queue.setItem(row, 2, QTableWidgetItem(accounts.get(batch.account_id, "—")))
+            self.table_queue.setItem(row, self.COL_NAME, name_item)
+            output_dir = os.path.abspath(batch.output_dir)
+            output_dir_item = QTableWidgetItem(f"📁 {output_dir}")
+            output_dir_item.setData(Qt.ItemDataRole.UserRole, output_dir)
+            output_dir_item.setToolTip(f"Nhấn để mở thư mục:\n{output_dir}")
+            output_dir_item.setForeground(QColor("#60a5fa"))
+            self.table_queue.setItem(row, self.COL_OUTPUT_DIR, output_dir_item)
+            self.table_queue.setItem(
+                row, self.COL_ACCOUNT,
+                QTableWidgetItem(accounts.get(batch.account_id, "—")),
+            )
             maximum = batch.max_continuations or batch.total_parts or 10
-            self.table_queue.setItem(row, 3, QTableWidgetItem(f"{batch.current_part}/{maximum}"))
+            self.table_queue.setItem(
+                row, self.COL_CONTINUATION,
+                QTableWidgetItem(f"{batch.current_part}/{maximum}"),
+            )
             status_item = QTableWidgetItem(batch.status)
             status_item.setForeground(QColor(self.STATUS_COLORS.get(batch.status, "#e5e7eb")))
             status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.table_queue.setItem(row, 4, status_item)
+            self.table_queue.setItem(row, self.COL_STATUS, status_item)
             status_combo = QComboBox()
             for status in ("PENDING", "SUCCESS", "FAILED"):
                 status_combo.addItem(status, status)
@@ -1322,7 +1324,7 @@ class GeminiView(QWidget):
                 lambda _index, batch_id=batch.id, combo=status_combo:
                 self._manual_status_changed(batch_id, combo)
             )
-            self.table_queue.setCellWidget(row, 4, status_combo)
+            self.table_queue.setCellWidget(row, self.COL_STATUS, status_combo)
             if batch.status == "SUCCESS":
                 detail = batch.result_path
             elif batch.status == "PENDING" and (batch.retry_count or 0) > 0:
@@ -1334,7 +1336,7 @@ class GeminiView(QWidget):
                 detail = batch.error_message or ""
             detail_item = QTableWidgetItem(detail or "")
             detail_item.setToolTip(detail or "")
-            self.table_queue.setItem(row, 5, detail_item)
+            self.table_queue.setItem(row, self.COL_DETAIL, detail_item)
         self._sync_all_batches_checkbox()
         self._update_stats()
 
@@ -1404,15 +1406,15 @@ class GeminiView(QWidget):
     def _selected_batch_ids(self):
         selected = []
         for row in range(self.table_queue.rowCount()):
-            checkbox = self.table_queue.cellWidget(row, 0).findChild(QCheckBox)
-            item = self.table_queue.item(row, 1)
+            checkbox = self.table_queue.cellWidget(row, self.COL_SELECT).findChild(QCheckBox)
+            item = self.table_queue.item(row, self.COL_NAME)
             if checkbox and checkbox.isChecked() and item:
                 selected.append(item.data(Qt.ItemDataRole.UserRole))
         return selected
 
     def _toggle_all_batches(self, checked):
         for row in range(self.table_queue.rowCount()):
-            container = self.table_queue.cellWidget(row, 0)
+            container = self.table_queue.cellWidget(row, self.COL_SELECT)
             checkbox = container.findChild(QCheckBox) if container else None
             if checkbox:
                 checkbox.setChecked(checked)
@@ -1420,7 +1422,7 @@ class GeminiView(QWidget):
     def _sync_all_batches_checkbox(self):
         checkboxes = []
         for row in range(self.table_queue.rowCount()):
-            container = self.table_queue.cellWidget(row, 0)
+            container = self.table_queue.cellWidget(row, self.COL_SELECT)
             checkbox = container.findChild(QCheckBox) if container else None
             if checkbox:
                 checkboxes.append(checkbox)
@@ -1724,9 +1726,9 @@ class GeminiView(QWidget):
             QMessageBox.information(self, "Không có lỗi", "Không có batch FAILED để chạy lại.")
             return
         for row in range(self.table_queue.rowCount()):
-            item = self.table_queue.item(row, 1)
+            item = self.table_queue.item(row, self.COL_NAME)
             if item and item.data(Qt.ItemDataRole.UserRole) in ids:
-                self.table_queue.cellWidget(row, 0).findChild(QCheckBox).setChecked(True)
+                self.table_queue.cellWidget(row, self.COL_SELECT).findChild(QCheckBox).setChecked(True)
 
     def delete_selected(self):
         ids = self._selected_batch_ids()
@@ -1802,29 +1804,29 @@ class GeminiView(QWidget):
 
     def _set_row(self, batch_id, account=None, continuation=None, status=None, detail=None):
         for row in range(self.table_queue.rowCount()):
-            item = self.table_queue.item(row, 1)
+            item = self.table_queue.item(row, self.COL_NAME)
             if item and item.data(Qt.ItemDataRole.UserRole) == batch_id:
                 if account is not None:
-                    self.table_queue.item(row, 2).setText(account)
+                    self.table_queue.item(row, self.COL_ACCOUNT).setText(account)
                 if continuation is not None:
-                    self.table_queue.item(row, 3).setText(continuation)
+                    self.table_queue.item(row, self.COL_CONTINUATION).setText(continuation)
                 if status is not None:
-                    status_item = self.table_queue.item(row, 4)
+                    status_item = self.table_queue.item(row, self.COL_STATUS)
                     status_item.setText(status)
                     status_item.setForeground(QColor(self.STATUS_COLORS.get(status, "#e5e7eb")))
-                    status_combo = self.table_queue.cellWidget(row, 4)
+                    status_combo = self.table_queue.cellWidget(row, self.COL_STATUS)
                     if isinstance(status_combo, QComboBox):
                         self._set_status_combo(status_combo, status)
                 if detail is not None:
-                    self.table_queue.item(row, 5).setText(detail)
-                    self.table_queue.item(row, 5).setToolTip(detail)
+                    self.table_queue.item(row, self.COL_DETAIL).setText(detail)
+                    self.table_queue.item(row, self.COL_DETAIL).setToolTip(detail)
                 break
         self._update_stats()
 
     def _update_stats(self):
         counts = {status: 0 for status in self.STATUS_COLORS}
         for row in range(self.table_queue.rowCount()):
-            item = self.table_queue.item(row, 4)
+            item = self.table_queue.item(row, self.COL_STATUS)
             if item and item.text() in counts:
                 counts[item.text()] += 1
         self.lbl_stats.setText(
@@ -1832,9 +1834,22 @@ class GeminiView(QWidget):
             f"Đang chạy: {counts['RUNNING']} | Thành công: {counts['SUCCESS']} | Lỗi: {counts['FAILED']}"
         )
 
+    def _open_output_folder(self, row, column):
+        if column != self.COL_OUTPUT_DIR:
+            return
+        item = self.table_queue.item(row, self.COL_OUTPUT_DIR)
+        output_dir = item.data(Qt.ItemDataRole.UserRole) if item else ""
+        if output_dir and os.path.isdir(output_dir):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(output_dir))
+        else:
+            QMessageBox.warning(
+                self, "Không thấy thư mục",
+                f"Thư mục lưu không còn tồn tại:\n{output_dir}",
+            )
+
     def _open_result(self, row, _column):
-        status = self.table_queue.item(row, 4)
-        path = self.table_queue.item(row, 5)
+        status = self.table_queue.item(row, self.COL_STATUS)
+        path = self.table_queue.item(row, self.COL_DETAIL)
         if status and path and status.text() == "SUCCESS" and os.path.isfile(path.text()):
             QDesktopServices.openUrl(QUrl.fromLocalFile(path.text()))
 
