@@ -1251,13 +1251,10 @@ class GeminiView(QWidget):
                     total_parts=maximum, current_part=0, status="PENDING",
                 )
                 db.add(batch)
-                db.flush()
-                # ID giúp nhiều batch cùng quốc gia và cùng folder không ghi đè file nhau.
-                batch.name = f"{display_name}_{batch.id}"
                 created += 1
                 logging.info(
-                    "[Gemini UI] Thêm batch id=%s country=%s; output_name=%s.txt",
-                    batch.id, country, batch.name,
+                    "[Gemini UI] Thêm batch country=%s; output_name=%s.txt",
+                    country, batch.name,
                 )
             db.commit()
             logging.info("[Gemini UI] Commit queue thành công; created=%s", created)
@@ -1293,7 +1290,9 @@ class GeminiView(QWidget):
             checkbox.toggled.connect(self._sync_all_batches_checkbox)
             layout.addWidget(checkbox)
             self.table_queue.setCellWidget(row, self.COL_SELECT, container)
-            output_name = batch.name or LANGUAGE_BY_COUNTRY.get(batch.country, batch.country)
+            output_name = LANGUAGE_BY_COUNTRY.get(
+                batch.country, batch.name or batch.country
+            )
             name_item = QTableWidgetItem(f"{output_name}.txt")
             name_item.setData(Qt.ItemDataRole.UserRole, batch.id)
             self.table_queue.setItem(row, self.COL_NAME, name_item)

@@ -352,8 +352,7 @@ class GeminiWorker(QThread):
                 worker_config.update({
                     "master_prompt": batch.master_prompt,
                     "output_dir": batch.output_dir,
-                    # Tên batch chứa ID để các row cùng quốc gia không ghi đè kết quả.
-                    "batch_name": batch.name or LANGUAGE_BY_COUNTRY.get(batch.country, batch.country),
+                    "batch_name": LANGUAGE_BY_COUNTRY.get(batch.country, batch.name),
                     "target_country": batch.country or batch.name,
                     "max_continuations": batch.max_continuations or 10,
                     "done_marker": batch.done_marker or "[[DONE]]",
